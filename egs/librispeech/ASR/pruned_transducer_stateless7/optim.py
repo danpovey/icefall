@@ -59,12 +59,12 @@ class LearnedGradient(Optimizer):
             params,
             lr=3e-02,
             size_lr_scale=0.1,
-            meta_lr_scale=1.0,
-            betas=(0.9, 0.98),
+            meta_lr_scale=0.01,
+            betas=(0.95, 0.98),
             eps=1.0e-08,
             param_min_rms=1.0e-05,
             param_max_rms=2.0,
-            lr_est_period=10,
+            lr_est_period=1,
             max_step_scale=2.0
     ):
 
@@ -107,11 +107,10 @@ class LearnedGradient(Optimizer):
             beta1, beta2 = group["betas"]
             eps = group["eps"]
             size_update_period = 4
-            param_min_eps = group["param_min_rms"]
-            param_max_eps = group["param_max_rms"]
+            param_min_rms = group["param_min_rms"]
+            param_max_rms = group["param_max_rms"]
             lr_est_period = group["lr_est_period"]
             max_step_scale = group["max_step_scale"]
-
 
             small_tensor_cutoff = 5  # cutoff below which we use Adam
 
@@ -129,11 +128,8 @@ class LearnedGradient(Optimizer):
 
                 # State initialization
                 if len(state) == 0:
-
                     state["step"] = 0
-
                     kwargs = {'device':p.device, 'dtype':p.dtype}
-
 
                     if p.numel() > 1:
                         # we learn the scale on the parameters in a way that
@@ -165,8 +161,7 @@ class LearnedGradient(Optimizer):
 
                         for dim in range(p.ndim):
                             size = p.shape[dim]
-                            if size == 1 or size == p.numel():
-                                # if size == p.numel(), is_one_axis == True above
+                            if size == 1:
                                 continue
 
                             state[f"lr_{dim}"] = torch.eye(size, **kwargs)
@@ -196,14 +191,16 @@ class LearnedGradient(Optimizer):
                 numel = p.numel()
                 if numel > 1:
                     # Update the size/scale of p, and set param_rms
-                    state["scale_grads"][step % size_update_period] = (p * grad).sum()
+                    scale_grads = state["scale_grads"]
+                    scale_grads[step % size_update_period] = (p * grad).sum()
                     if step % size_update_period == size_update_period - 1:
                         # this learns the overall scale on the parameter, by shrinking or
                         # expanding it.
-                        state["param_rms"] = (param ** 2).mean().sqrt().clamp_(min=eps)
+                        param_rms = state["param_rms"]
+                        param_rms.copy_((p ** 2).mean().sqrt().clamp_(min=eps))
                         if step > 0:
                             self._size_update(p, state,
-                                              scale_grads, param_rms,
+                                              param_rms, scale_grads,
                                               beta1, beta2, step, size_lr,
                                               param_min_rms, param_max_rms)
 
@@ -213,8 +210,8 @@ class LearnedGradient(Optimizer):
                     # parameter rms.
                     self._step_small(beta1, beta2, eps, lr, p, grad, state)
                 else:
-                    if step % lr_est_period == 0:
-                        self._update_lrs(group, grad, state)
+                    if step % lr_est_period == 0 and step > 0:
+                        self._update_lrs(group, p, grad, state)
                     self._step(group, p, grad, state)
 
                 state["step"] = step + 1
@@ -224,8 +221,11 @@ class LearnedGradient(Optimizer):
     def _size_update(self,
                      p: Tensor,
                      state: dict,
+                     param_rms: Tensor,
+                     scale_grads: Tensor,
                      beta1: float,
                      beta2: float,
+                     step: int,
                      size_lr: float,
                      param_min_rms: float,
                      param_max_rms: float) -> None:
@@ -262,11 +262,11 @@ class LearnedGradient(Optimizer):
 
         scale_exp_avg_sq = state["scale_exp_avg_sq"]
         scale_exp_avg_sq.mul_(beta2_corr).add_(
-            (scale_grads ** 2).mean(), value=1-beta2_corr)
+            (scale_grads ** 2).mean(), alpha=1-beta2_corr)
 
         scale_exp_avg = state["scale_exp_avg"]
         scale_exp_avg.mul_(beta1_corr).add_(
-            scale_grads.mean(), value=1-beta1_corr)
+            scale_grads.mean(), alpha=1-beta1_corr)
 
         # The 1st time we reach here is when size_step == 1.
         size_step = (step + 1) // size_update_period
@@ -290,12 +290,14 @@ class LearnedGradient(Optimizer):
 
     def _update_lrs(self,
                     group: dict,
+                    p: Tensor,
                     grad: Tensor,
                     state: dict) -> None:
         """
         Updates the learning-rate matrices state["lr_{dim}"].
         Args:
           group: dict to look up configuration values
+               p:  current parameter that we are updating
            grad:  current gradient for the parameter that we are updating
           state: state dict for the current parameter
         """
@@ -303,20 +305,18 @@ class LearnedGradient(Optimizer):
         meta_lr = group["lr"] * group["meta_lr_scale"]
         beta1, beta2 = group["betas"]
         eps = group["eps"]
-        moving_g = state["exp_avg"]
 
-        ndim = p.ndim
+        ndim = grad.ndim
 
         # Update grad_cov.
         self._store_grad_stats(grad, state, beta2)
 
-
+        moving_g = state["exp_avg"]
         with torch.enable_grad():
-
             # To update the learning rate matrices, we are asking the question, "What if,
             # on the previous step, we had used a slightly different learning-rate matrix?
             # How would that have affected the loss function on the current step?"
-            moving_d = self._multiply_by_lr(moving_g)
+            moving_d = self._multiply_by_lr(moving_g, state)
 
             # moving_d_rms is an rms value of moving_d computed via inner
             # products with the grad, which is a basis-independent way of
@@ -328,7 +328,7 @@ class LearnedGradient(Optimizer):
             # sensitive to the norm used.  If we used the regular norm on moving_d, it
             # might concentrate all the movement in "don't-care" dimensions in
             # parameter space, assuming such dimensions exist.
-            moving_d_rms = (self._multiply_by_grad_cov(moving_d) * moving_d).mean().sqrt()
+            moving_d_rms = (self._multiply_by_grad_cov(moving_d, state) * moving_d).mean().sqrt()
 
             # moving_d_norm is the parameter "delta" moving_d, length-normaized but still with
             # an arbitrary multiplicative constant.  We don't care about this constant
@@ -345,20 +345,18 @@ class LearnedGradient(Optimizer):
             # (pseudo-) loss function would be (p * grad).sum(), which ignoring
             # [something] as it contributes no gradient, becomes -alpha *
             # (moving_d_norm * grad).sum(), and ignoring the scale alpha, that
-            # is -(moving_d_norm * grad).sum(), so we call this neg_loss as it's the
-            # negative of hte iss.
-            neg_loss = (grad * moving_d_norm).sum()
+            # is -(moving_d_norm * grad).sum(), so we call (moving_d_norm * grad).sum()
+            # neg_loss as it's the negative of the loss.
+            neg_loss = (moving_d_norm * grad).sum()
 
             # after the following, there will grads in state[f"lr_{dim}"]
             # that are the negative of loss function grads, i.e. we want to go
             # in the forward grad direction.
             neg_loss.backward()
 
-            for dim in range(ndim):
-                if p.shape[dim] != 1:
-                    self._update_lr(state[f"lr_{dim}"], meta_lr)
-
-
+        for dim in range(ndim):
+            if grad.shape[dim] != 1:
+                self._update_lr(state[f"lr_{dim}"], meta_lr)
 
     def _update_lr(self,
                    lr_mat: Tensor,
@@ -377,6 +375,7 @@ class LearnedGradient(Optimizer):
                 meta_lr: The speed with which we learn lr_mat.
         """
         grad = lr_mat.grad
+        del lr_mat.grad
 
         if random.random() < 0.1:
             # A check.
@@ -390,20 +389,21 @@ class LearnedGradient(Optimizer):
         # equal to I.  To make it easier to keep the result positive definite, we learn A rather than N.
         # We'll use a convention where A_grad has the same orientation as A, i.e. A_grad_ij equals the grad
         # of loss w.r.t A_ij.
-        # The grad w.r.t A equals (N M_grad)^T + (M_grad N) = 2 (M_grad N).  We don't care about scalar
-        # factors at this point (we'll normalize them out), so ignore the factor of 2, and say;
-        # A_grad = M_grad N.
-        A_grad = torch.matmul(grad, lr_mat)
+        # The grad w.r.t A equals  (N M_grad^T)^T + (M_grad^T N) = (M_grad^T + M_grad) N.
+
+        A_grad = torch.matmul(grad + grad.t(), lr_mat)
 
 
         # Normalize the size of `A_grad` (there are arbitrary scalar factors in this loss function),
         # and include meta_lr
-        A_grad = A_grad * (meta_lr / ((A_grad ** 2).mean().sqrt() + 1.0e-20))
+        size = A_grad.shape[0]
+        alpha = meta_lr * (size ** -0.5)
+        A_grad = A_grad * (alpha / ((A_grad ** 2).mean().sqrt() + 1.0e-20))
 
         # So the updated A is just I plus lr_mat * normalize[A_grad]
 
-        size = A.shape[0]
-        A = torch.eye(size, device=A.device, dtype=A.dtype) + meta_lr * A_grad
+        size = A_grad.shape[0]
+        A = torch.eye(size, device=A_grad.device, dtype=A_grad.dtype) +  A_grad
 
         # the result is positive semidefinite if the initial LR_mat was positive semidefinite,
         # because it is of the form X X^T where X =  A lr_mat^{0.5}
@@ -413,6 +413,8 @@ class LearnedGradient(Optimizer):
         # Also ensure it is perfectly symmetric, or it may drift away from symmetry due to
         # roundoff.
         lr_mat[:] = (lr_mat + lr_mat.t()) / (2.0 * lr_mat.diag().mean())
+        #if random.random() < 0.01:
+        #    print("lr_mat = ", lr_mat)
 
 
     def _step(self,
@@ -441,11 +443,11 @@ class LearnedGradient(Optimizer):
 
         moving_g = state["exp_avg"]
         # include the current grad in moving_g
-        moving_g.mul_(beta1).add(grad, alpha=(1-beta1))
+        moving_g.mul_(beta1).add_(grad, alpha=(1-beta1))
 
         # get the parameter delta (up to a scalar factor) by multiplying by a
         # learning-rate matrix for each dimension.
-        moving_d = self._multiply_by_lr(moving_g)
+        moving_d = self._multiply_by_lr(moving_g, state)
 
         # moving_d contains a moving average of parameter change contributions
         # from multiple iterations with weights: (1-beta) * (1 + beta + beta^2 +
@@ -473,7 +475,7 @@ class LearnedGradient(Optimizer):
         # apply max_step_scale to limit magnitude of change on individual
         # elements, this should help stability.
         limit = moving_d_rms * max_step_scale
-        moving_d_clamped = moving_d.clamp_(min=-limit, max=limit)
+        moving_d_clamped = moving_d.clamp(min=-limit, max=limit)
 
         if random.random() < 0.001:
             clamp_diff_rms = ((moving_d_clamped - moving_d) ** 2).mean().sqrt()
@@ -532,110 +534,10 @@ class LearnedGradient(Optimizer):
             # use it.
             grad_cov.mul_(beta2).add_(torch.matmul(g.t(), g))
 
-    def _estimate_projections(self,
-                              p: Tensor,
-                              state: dict,
-                              param_eps: float,
-                              param_rel_eps: float,
-                              param_rel_max: float,
-                              param_reverse_cutoff: float,
-                              beta3: float,
-                              param_pow: float,
-                              grad_pow: float,
-                              grad_min_rand: float,
-    ) -> None:
-        """
-        Estimate the per-dimension projections proj_0, proj_1 and so on.
-        These projections, when applied with forward==True by _change_coordinates(),
-        first rotate into a space
-        where the optimal learning-rate-scale is diagonalized (see self._estimate_proj);
-        then scale by the parameter scale.  When applied with forward == False
-        they first scale by the parameter scale and then rotate back into canonical
-        co-ordinates.  (Thus, applying with forward==True and then forward==False
-        is not a round trip).
-
-        Args:
-             p: The parameter for which we are etimating the projections.  Supplied
-                because we need this to estimate parameter covariance matrices in
-                each of its tensor directions.
-            state: The state dict for this parameter tensor
-            param_eps:  Small epsilon representing a minimum parameter magnitude;
-                 once the estimated parameter rms for some element of p gets below
-                 this value, we'll treat it as having this value.
-            param_rel_eps:  Another constraint on minimum parameter rms, relative to
-                 sqrt(overall_param_rms), where overall_param_rms is the sqrt of the
-                 parameter variance averaged over the entire tensor.
-            beta3: discounting parameter for param_cov, applied once every estimate_period.
-            param_pow: param_pow==1.0 means fully normalizing for parameter scale;
-                 setting to a smaller value closer to 0.0 means partial normalization.
-           grad_min_rand: minimum proportion of random tensor to mix with the
-                 gradient covariance matrix.
-        """
-        kwargs = {'device':p.device, 'dtype':p.dtype}
-
-        ndim = p.ndim
-
-        for dim in range(ndim):
-            size = p.shape[dim]
-            if size == 1:
-                continue
-            proj = state[f"proj_{dim}"]
-
-            if proj.ndim == 2:
-                # This dimension gets the full-covariance treatment.
-                count = state[f"grad_cov_count_{dim}"]
-                assert count != 0
-                grad_cov = state[f"grad_cov_{dim}"] / count
-                del state[f"grad_cov_{dim}"]  # save memory
-
-                #self._randomize_lowrank_cov(grad_cov, count, p.shape,
-                #                            grad_min_rand)
-
-                cur_param_cov = self._get_param_cov(p, dim)
-                cur_param_cov = cur_param_cov / (cur_param_cov.diag().mean() + 1.0e-20)  # normalize size..
-                param_cov = state[f"param_cov_{dim}"]
-                param_cov.mul_(beta3).add_(cur_param_cov, alpha=(1-beta3))
-
-                # We want the orthogonal matrix U that diagonalizes P, where
-                # P is the SPD matrix such that P G^{param_pow} P^T == C^{param_pow},
-                # where G == grad_cov and C == param_cov.
-                # .. this is the same as the U that diagonalizes a different P
-                # such that P G P^T == C^{param_pow/(2-param_pow)},
-                # since the P's are related by taking-to-a-power.
-
-                num_samples = p.numel() // size
-                reverse_cutoff = (param_reverse_cutoff if num_samples > size//4 else 1.0e+10)
-                P = self._estimate_proj(grad_cov,
-                                        param_cov,
-                                        param_pow / grad_pow,
-                                        param_rel_eps,
-                                        param_rel_max,
-                                        reverse_cutoff)
-
-
-                # The only thing we want from P is the basis that diagonalizes
-                # it, i.e. if we do the symmetric svd P = U S U^T, we can
-                # interpret the shape of U as (canonical_coordinate,
-                # diagonalized_coordinate)
-                U, S, _ = P.svd()
-                # `proj` will be of shape (diagonalized_coordinate, canonical_coordinate)
-                # Later we will modify `proj` to incorporate the parameter scale.
-                proj[:] = U.t()
-            else:
-                # This dimension will be treated diagonally.  For now just set `proj` to
-                # all ones, later we will modify it in _estimate_params_scale()
-                proj.fill_(1.0)
-
-        self._estimate_param_scale(p, state, param_eps,
-                                   param_pow, param_rel_eps, param_rel_max,
-                                   param_reverse_cutoff)
-
-
 
     def _multiply_by_lr(self,
                         grad: Tensor,
-                        state: dict,
-                        forward: bool) -> Tensor:
+                        state: dict) -> Tensor:
         """
         Multiply the grad by a positive semi-definite matrix for each dimension,
         interpreted as a non-scalar learning-rate factor.
@@ -657,8 +559,7 @@ class LearnedGradient(Optimizer):
 
     def _multiply_by_grad_cov(self,
                               grad: Tensor,
-                              state: dict,
-                              forward: bool) -> Tensor:
+                              state: dict) -> Tensor:
         """
         Multiply the grad by a positive semi-definite matrix for each dimension,
         interpreted as a non-scalar learning-rate factor.
@@ -684,50 +585,6 @@ class LearnedGradient(Optimizer):
 
 
 
-    def _change_coordinates(self,
-                            grad: Tensor,
-                            state: dict,
-                            forward: bool) -> Tensor:
-        """
-        Multiply the grad by a matrix for each dimension, interpreted as a non-orthogonal
-        basis change.
-        If forward == True, `grad` is interpreted as: gradient -> gradient in new basis;
-        if forward == False, it is interpreted as:
-              parameter-change in new basis -> parameter-change in canonical basis.
-        These differ by a transpose (this is not the same as inversion as the matrix is not
-        orthogonal).  Therefore the co-ordinate change applied both forward and backward
-        does not represent a "round trip".
-
-        We know at this point that `grad` has more than one non-trivial dimension/axis
-        (i.e. >1 dimension with size != 1).
-
-        Args:
-            p: the Parameter that the grad is for; may be needed if we re-estimating
-               the learning-rate matrix
-            grad: the gradient to precondition (will not be modified by this function)
-            state: the state-dict where will look up the projections.
-       Returns:
-             The co-ordinate-changed grad or parameter change
-        """
-        cur_grad = grad
-        ndim = grad.ndim
-        step = state["step"]
-        for dim in range(ndim):
-            size = grad.shape[dim]
-            if size == 1:
-                continue
-            proj = state[f"proj_{dim}"]
-
-            if proj.ndim == 1:
-                # We are treating this dimension diagonally because it is too big.
-                proj = proj.reshape(size, *([1] * (ndim-1-dim)))
-                cur_grad = cur_grad * proj
-            else:
-                cur_grad = self._multiply_on_dim(cur_grad, proj, dim, forward)
-        return cur_grad
-
-
-
     def _multiply_on_dim(self, x: Tensor, M: Tensor, dim: int) -> Tensor:
         """
         Matrix-multiplies x by symmetric matrix `M` on x's dimension numbered `dim`
@@ -737,205 +594,8 @@ class LearnedGradient(Optimizer):
                (x.shape[dim], x.shape[dim]).
         """
         # Note: can use either M or M.t() here because M is symmetric
-        return torch.matmul(x.transpose(-1, dim), M.t())
+        return torch.matmul(x.transpose(-1, dim), M.t()).transpose(-1, dim)
 
-
-
-    def _smooth_param_diag_var(self,
-                               param_diag: Tensor,
-                               param_pow: float,
-                               param_rel_eps: float,
-                               param_rel_max: float,
-                               param_reverse_cutoff: float) -> Tensor:
-        """
-        Applies the smoothing formula to the eigenvalues of the parameter covariance
-        tensor.
-        (Actually when we use this function in _get_param_cov, they won't exactly
-        be the eigenvalues because we diagonalize relative to the grad_cov,
-        but they will be parameter covariances in certain directions).
-        """
-        # normalize  so mean = 1.0
-        param_diag = param_diag / (param_diag.mean()  + 1.0e-20)
-        # use 1/(1/x + 1/y) to apply soft-max of param_diag with param_rel_max.
-        # use param_rel_eps here to prevent division by zero.
-        ans = 1. / (1. / (param_diag + param_rel_eps) + 1. / param_rel_max)
-
-        # 2nd factor below becomes a 1/param_diag type of function when
-        # param_diag >> param_reverse_cutoff.
-        ans = ans * (param_reverse_cutoff / (param_diag + param_reverse_cutoff))
-        return ans ** param_pow
-
-
-    def _estimate_proj(self,
-                       grad_cov: Tensor,
-                       param_cov: Tensor,
-                       param_pow: float,
-                       param_rel_eps: float,
-                       param_rel_max: float,
-                       param_reverse_cutoff: float) -> Tensor:
-        """
-        Return a symmetric positive definite matrix P such that
-             (P grad_cov P^T == param_cov^{param_pow}),
-        i.e. a descent direction that makes the covariance of steps look
-        like the covariance of parameter.  This will be normalizes so
-        that the mean of its diagonal is 1.0 (since we'll have a separate
-        such projection per dim of the tensor, and we don't want to count
-        the scalar factor many times).
-
-        Args:
-            grad_cov:  Covariance of gradients, a symmetric-positive-definite
-                      matrix [except for roundoff!] of shape (size, size)
-            param_cov:  Covariance of parameters, a symmetric-positive-definite
-                      matrix [except for roundoff!] of shape (size, size)
-            param_pow: Power that we take "param_cov" to, between 0 and 1.
-                      Normally it will be 1, and not all the comments mention it.
-       Returns:
-            A matrix P such that (alpha P grad_cov P^T == param_cov^param_pow)
-        """
-        # symmetrize grad_cov and param_cov.  The projection P only cares about the
-        # relative sizes, so doubling both of them does not matter.
-        G = grad_cov + grad_cov.t()
-        C = param_cov + param_cov.t()
-        U, S, V = C.svd()
-
-        # Using G == grad_cov and C == param_cov, and not writing transpose because
-        # all these quantities are symmetric, we can use:
-        #
-        #  P = C^{0.5} (C^{0.5} G C^{0.5})^{-0.5} C^{0.5}
-        #
-        # You can verify fairly easily that P G P == C: multiply on left and right
-        # by C^{-0.5} on each side and you can see that both sides equal I.
-        #
-        # We can reduce the amount of roundoff by, after decomposing C
-        # with SVD as (U S U^T), writing C^{0.5} = U Q = Q^T U^T, with Q = S^0.5 U^T.
-        #
-        # Then we can write P as follows:
-        #  P = Q^T U^T (U Q G Q^T U^T)^{-0.5} U Q,
-        # and we easily show that for orthogonal U, (U X U^T)^{-0.5} = U X^{-0.5} U^T, so we
-        # can do this and cancel U^T U = U U^T = I, giving:
-        #  P = Q^T (Q G Q^T)^{-0.5} Q.
-
-        # because C is symmetric, C == U S U^T, we can ignore V.
-        # S_sqrt is S.sqrt() in the limit where param_pow == 1.0,
-        # param_rel_eps=0, param_rel_max=inf
-
-        S_smoothed = self._smooth_param_diag_var(S, param_pow,
-                                                 param_rel_eps, param_rel_max,
-                                                 param_reverse_cutoff)
-        S_sqrt = S_smoothed ** 0.5
-        Q = (U * S_sqrt).t()
-
-        X = torch.matmul(Q, torch.matmul(G, Q.t()))
-
-        U2, S2, _ = X.svd()
-        # Because X^{-0.5} = U2 S2^{-0.5} U2^T, we have
-        # P = Q^T U2 S2^{-0.5} U2^T Q
-        #   = Y Y^T, where
-        # Y = Q^T U2 S2^{-0.25}
-
-        S2_pow = (S2 + 1.0e-35) ** -0.25
-        Y = torch.matmul(Q.t(), U2) * S2_pow
-
-        P = torch.matmul(Y, Y.t())
-
-        if random.random() < 1.0: #0.025:
-            # TODO: remove this testing code.
-            assert (P - P.t()).abs().mean() < 0.01  # make sure symmetric.
-            try:
-                P = 0.5 * (P + P.t())
-                _,s,_ = P.svd()
-                print(f"Min,max eig of P: {s.min()},{s.max()}")
-            except:
-                pass
-            # testing...  note, this is only true modulo "eps"
-            C_check = torch.matmul(torch.matmul(P, G), P)
-            C_smoothed = torch.matmul(Q.t(), Q)
-            # C_check should equal C_smoothed
-            C_diff = C_check - C_smoothed
-            # Roundoff can cause significant differences, so use a fairly large
-            # threshold of 0.001.  We may increase this later or even remove the check.
-            if not C_diff.abs().mean() < 0.01 * C_smoothed.diag().mean():
-                print(f"Warning: large C_diff: {C_diff.abs().mean()}, C diag mean: {C_smoothed.diag().mean()}")
-
-        return P
-
-    def reset_speedup(self):
-        """
-        Reset the step_period so that we'll do a step each time, until the next
-        time
-        """
-        for group in self.param_groups:
-            group["speedup_step"] = -group["speedup_first_step"]
-            for p in group["params"]:
-                state = self.state[p]
-                state["step_period"] = 1
-
-    def _recalibrate_speedup(self, group: dict):
-        param_prods = []
-        speedup = group["lr_for_speedup"] / group["lr"]
-        if speedup > 10.0:
-            speedup = 10.0
-        if speedup <= 1.0:
-            for p in group["params"]:
-                state = self.state[p]
-                state["step_period"] = 1
-            return
-
-
-        _, beta2, _ = group["betas"]
-
-        for p in group["params"]:
-            if p.grad is None:
-                continue
-            # We ignore the part of the parameter change that comes from the scale
-            # (see 'scale_deriv' in the code)
-            state = self.state[p]
-            step = state["step"]
-
-            # the sqrt() is just a heuristic, it seems to give periods that work better.
-            param_prods.append(state["grad_times_step"].sqrt())
-
-
-        param_prods = torch.stack(param_prods).to('cpu')
-        # TEMP
-        param_prods = param_prods.sqrt()
-        avg_update_freq = 1.0 / speedup
-        param_freqs = param_prods * (avg_update_freq / param_prods.mean())
-
-        # Don't delay more than 1 / (3*speedup) steps for any parameter, to
-        # ensure that no parameter waits super-long for an update.  Note: with
-        # beta=0.1, this would mean an average delay of about 30*speedup steps
-        # before the gradient makes it to the parameter.
-        min_freq = 1.0 / (3 * speedup)
-
-        # get the mean after applying limits of [min_freq..1] for the frequencies of
-        # update
-        param_freqs_mean = param_freqs.clamp(min=min_freq, max=1.0).mean()
-        # renormalize after applying min and max limits
-        param_freqs = param_freqs * (avg_update_freq / param_freqs_mean)
-        # ...and apply the limits again.
-        param_freqs = param_freqs.clamp(min=min_freq, max=1.0)
-        param_periods = (1.0 / param_freqs).to(torch.int32)  # .to(torch.int32) rounds down
-
-        actual_speedup = 1.0 / (1.0 / param_periods).mean()
-
-        param_prods = param_prods.tolist()
-        param_freqs = param_freqs.tolist()
-        param_periods = param_periods.tolist()
-
-        logging.info(f"LearnedGradient._recalibrate_speedup: speedup = {speedup:.2g}, actual_speedup = {actual_speedup:.2g}")
-        print_info = random.random() < 0.01
-        i = 0
-        for p in group["params"]:
-            if p.grad is None:
-                continue
-            state = self.state[p]
-            state["step_period"] = param_periods[i]
-            if print_info:
-                logging.info(f"Shape = {p.shape}, prod = {param_prods[i]}, freq = {param_freqs[i]}, period = {param_periods[i]}.")
-            i += 1
-
-        # Do nothing more, as yet.
 
 
 
@@ -1592,8 +1252,6 @@ def _test_eve_cain():
         avg_loss = 0.0
         for epoch in range(150):
             scheduler.step_epoch()
-            if epoch == 100 and iter in [2,3]:
-                optim.reset_speedup()  # check it doesn't crash.
 
             if epoch == 130:
                 opts = diagnostics.TensorDiagnosticOptions(
