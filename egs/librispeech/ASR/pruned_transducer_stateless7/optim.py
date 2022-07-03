@@ -311,43 +311,9 @@ class LearnedGradient(Optimizer):
         # Update grad_cov.
         self._store_grad_stats(grad, state, beta2)
 
-        moving_g = state["exp_avg"]
         with torch.enable_grad():
-            # To update the learning rate matrices, we are asking the question, "What if,
-            # on the previous step, we had used a slightly different learning-rate matrix?
-            # How would that have affected the loss function on the current step?"
-            moving_d = self._multiply_by_lr(moving_g, state)
 
-            # moving_d_rms is an rms value of moving_d computed via inner
-            # products with the grad, which is a basis-independent way of
-            # computing the rms value.  you have to view this as the rms times
-            # an arbitrary multiplicative factor.  in the "real" update we don't
-            # actually do the length normalization like this because it's slow,
-            # we do it a different, simpler way; but here we do it this way
-            # because we are computing gradients and it's going to make it more
-            # sensitive to the norm used.  If we used the regular norm on moving_d, it
-            # might concentrate all the movement in "don't-care" dimensions in
-            # parameter space, assuming such dimensions exist.
-            moving_d_rms = (self._multiply_by_grad_cov(moving_d, state) * moving_d).mean().sqrt()
-
-            # moving_d_norm is the parameter "delta" moving_d, length-normaized but still with
-            # an arbitrary multiplicative constant.  We don't care about this constant
-            # because we are going to normalize the grad length when we do the update;
-            # but it's important to have normalized by dividing by moving_d_rms because it
-            # makes the gradient "scale-independent" in the sense that it is zero in
-            # the direction of increasing or decreasing the parameter scale.
-            moving_d_norm = moving_d / moving_d_rms
-
-            # view the current parameter p as [something] - alpha *
-            # moving_d_norm, where alpha contains the learning rate and other
-            # factors, but we don't care about the numerical value of alpha
-            # because we're going to divide by the gradient norm anyway.  The
-            # (pseudo-) loss function would be (p * grad).sum(), which ignoring
-            # [something] as it contributes no gradient, becomes -alpha *
-            # (moving_d_norm * grad).sum(), and ignoring the scale alpha, that
-            # is -(moving_d_norm * grad).sum(), so we call (moving_d_norm * grad).sum()
-            # neg_loss as it's the negative of the loss.
-            neg_loss = (moving_d_norm * grad).sum()
+            neg_loss = (grad * self._multiply_by_lr(p, state)).sum()
 
             # after the following, there will grads in state[f"lr_{dim}"]
             # that are the negative of loss function grads, i.e. we want to go
@@ -377,11 +343,11 @@ class LearnedGradient(Optimizer):
         grad = lr_mat.grad
         del lr_mat.grad
 
-        if random.random() < 0.1:
+        if random.random() < 0.01:  # Disable this check, no longer valid mathematically buty for info.
             # A check.
             inner = (grad * lr_mat).sum() / ((grad ** 2).sum() * (lr_mat ** 2).sum()).sqrt()
-            if inner.abs() > 0.01:
-                logging.info(f"Warning: inner product of lr with grad is {inner}, should be zero; dim is {lr_mat.shape[0]}")
+            if inner.abs() > 0.05:
+                logging.info(f"Info: inner product of lr with grad is {inner}, should be zero; dim is {lr_mat.shape[0]}")
 
         # OK. suppose lr_mat = M, which is symmetric positive definite.
         # Decompose: M = A N A^T
@@ -389,8 +355,13 @@ class LearnedGradient(Optimizer):
         # equal to I.  To make it easier to keep the result positive definite, we learn A rather than N.
         # We'll use a convention where A_grad has the same orientation as A, i.e. A_grad_ij equals the grad
         # of loss w.r.t A_ij.
-        # The grad w.r.t A equals  (N M_grad^T)^T + (M_grad^T N) = (M_grad^T + M_grad) N.
-
+        # We can imagine we are maximizing an objective of the form:
+        #  tr(M_grad^T M) = tr(M_grad^T A N A^T).
+        #
+        # The grad w.r.t A equals  (N A M_grad^T)^T + (M_grad^T A N)
+        #                         =  (N M_grad^T)^T + (M_grad^T N)
+        #                         =  (M_grad + M_grad^T) N.
+        #                         = (M_grad + M_grad^T) M, since N numerically equals M.
         A_grad = torch.matmul(grad + grad.t(), lr_mat)
 
 
@@ -1244,8 +1215,8 @@ def _test_eve_cain():
 
         if iter == 0: optim = Eve(m.parameters(), lr=0.003)
         elif iter == 1: optim = Cain(m.parameters(), lr=0.03)
-        elif iter == 2: optim = LearnedGradient(m.parameters(), lr=0.03)
-        elif iter == 3: optim = LearnedGradient(m.parameters(), lr=0.03)
+        elif iter == 2: optim = LearnedGradient(m.parameters(), lr=0.05)
+        elif iter == 3: optim = LearnedGradient(m.parameters(), lr=0.05)
         scheduler = Eden(optim, lr_batches=200, lr_epochs=5, verbose=False)
 
         start = timeit.default_timer()
