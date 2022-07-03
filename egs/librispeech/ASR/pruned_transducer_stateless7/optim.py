@@ -59,7 +59,7 @@ class LearnedGradient(Optimizer):
             params,
             lr=3e-02,
             size_lr_scale=0.1,
-            meta_lr_scale=0.01,
+            meta_lr_scale=0.1,
             betas=(0.95, 0.98),
             eps=1.0e-08,
             param_min_rms=1.0e-05,
@@ -165,12 +165,6 @@ class LearnedGradient(Optimizer):
                                 continue
 
                             state[f"lr_{dim}"] = torch.eye(size, **kwargs)
-                            # Some parts of the update -- the parts where we are
-                            # doing to update lr_{dim} will require grad.  these
-                            # parts will be done inside torch.enable_grad().
-                            # The rest of this function is inside no_grad(), so
-                            # it will ignore the requires_grad == True.
-                            state[f"lr_{dim}"].requires_grad = True
 
                             # grad_cov_{dim} is the covariance of gradients on this axis,
                             # treating all other axes as as a batch axis.  This is needed
@@ -309,39 +303,36 @@ class LearnedGradient(Optimizer):
         ndim = grad.ndim
 
         # Update grad_cov.
-        self._store_grad_stats(grad, state, beta2)
+        # Now no longer needed.
+        # self._store_grad_stats(grad, state, beta2)
 
-        with torch.enable_grad():
-
-            neg_loss = (grad * self._multiply_by_lr(p, state)).sum()
-
-            # after the following, there will grads in state[f"lr_{dim}"]
-            # that are the negative of loss function grads, i.e. we want to go
-            # in the forward grad direction.
-            neg_loss.backward()
 
         for dim in range(ndim):
             if grad.shape[dim] != 1:
-                self._update_lr(state[f"lr_{dim}"], meta_lr)
+                self._update_lr(dim, p, grad, state[f"lr_{dim}"], meta_lr)
 
     def _update_lr(self,
+                   dim: int,
+                   p: Tensor,
+                   grad: Tensor,
                    lr_mat: Tensor,
                    meta_lr: float) -> None:
         """
-        Do one step of update for learning rate matrix 'lr_mat', which we assume has already
-        has its `grad` property populated with the grad of the negative loss (our special
-        loss that we use to train the learning rate matrix).  Also delete lr_mat.grad
-
-        Args:
-                lr_mat: The symmetric positive-semidefinite (PSD) learning-rate matrix.
-                        Will have its .grad populated with the derivative of a negated
-                        loss function (i.e. to be maximized), that we use to optimize
-                        this learning-rate matrix.  lr_mat.grad will be deleted and
-                        lr_mat will be updated by one step.
+        Do one step of update for learning rate matrix 'lr_mat'.
+           TODO: document.
                 meta_lr: The speed with which we learn lr_mat.
         """
-        grad = lr_mat.grad
-        del lr_mat.grad
+
+        p = p.transpose(dim, -1)
+        p = p.reshape(-1, p.shape[-1])
+        grad = grad.transpose(dim, -1)
+        grad = grad.reshape(-1, grad.shape[-1])
+        prod = torch.matmul(p.t(), grad)
+        # we are only interested in the symmetrized version of the grad, since
+        # the underlying thing is symmetric [as we only want descent
+        # directions], although the noisy gradients may be asymmetric.
+        grad = -(prod + prod.t())
+
 
         if random.random() < 0.01:  # Disable this check, no longer valid mathematically buty for info.
             # A check.
@@ -1215,8 +1206,8 @@ def _test_eve_cain():
 
         if iter == 0: optim = Eve(m.parameters(), lr=0.003)
         elif iter == 1: optim = Cain(m.parameters(), lr=0.03)
-        elif iter == 2: optim = LearnedGradient(m.parameters(), lr=0.05)
-        elif iter == 3: optim = LearnedGradient(m.parameters(), lr=0.05)
+        elif iter == 2: optim = LearnedGradient(m.parameters(), lr=0.1)
+        elif iter == 3: optim = LearnedGradient(m.parameters(), lr=0.1)
         scheduler = Eden(optim, lr_batches=200, lr_epochs=5, verbose=False)
 
         start = timeit.default_timer()
