@@ -64,7 +64,7 @@ class LearnedGradient(Optimizer):
             eps=1.0e-08,
             param_min_rms=1.0e-05,
             param_max_rms=2.0,
-            lr_est_period=1,
+            lr_est_period=2,  # TODO: increase.
             max_step_scale=2.0
     ):
 
@@ -112,8 +112,6 @@ class LearnedGradient(Optimizer):
             lr_est_period = group["lr_est_period"]
             max_step_scale = group["max_step_scale"]
 
-            small_tensor_cutoff = 5  # cutoff below which we use Adam
-
             for p in group["params"]:
                 if p.grad is None:
                     continue
@@ -137,53 +135,51 @@ class LearnedGradient(Optimizer):
                         # moving-average square of the gradient w.r.t. this
                         # scalar scale.
                         state["scale_exp_avg_sq"] = torch.zeros((), **kwargs)
-                        state["scale_exp_avg"] = torch.zeros((), **kwargs)
                         # for speed, we do the scale update only periodically,
                         # and meanwhile we store the derivs w.r.t. the grad scale
-                        # as a list
+                        # as a list.
                         state["scale_grads"] = torch.zeros(size_update_period, **kwargs)
 
-                    state["exp_avg"] = torch.zeros_like(
+                    # delta is for momentum; it combines the momentum for the
+                    # regular update in self._step(), and for the scale-learning
+                    # updates.
+                    state["delta"] = torch.zeros_like(
                         p, memory_format=torch.preserve_format
                     )
+                    if p.numel() > 1 and lr_est_period > 1:
+                        # cached_grad is a summed version of the raw grad that
+                        # is stored until lr_est_period, and then zeroed. after
+                        # self._update_lrs().
+                        state["cached_grad"] = torch.zeros_like(
+                            p, memory_format=torch.preserve_format
+                        )
 
-                    if p.numel() > small_tensor_cutoff:
-                        # moving_grad is a moving average of the raw gradient.
-                        # We do the accumulation on the input side because it
-                        # makes it easier to get grads w.r.t. the learning rate
-                        # matrices.
+                    # The scalar exp_avg_sq helps determine the scalar factor in
+                    # the learning rate for this tensor, it's a mean of the
+                    # exp_avg_sq of Adam.
+                    state["exp_avg_sq"] = torch.zeros((), **kwargs)
 
-                        # "scale" is just a per-tensor scalar that determines the
-                        # rate of learning (in terms of the rms value of the change
-                        # in parameter)
+                    if p.numel() > 1:
+                        # param_rms also determines the scalar part of the learning
+                        # rate (this is out way of achieving scale-independence)
                         param_rms = (p**2).mean().sqrt().add_(eps)
                         state["param_rms"] = param_rms
 
-                        for dim in range(p.ndim):
-                            size = p.shape[dim]
-                            if size == 1:
-                                continue
+                    for dim in range(p.ndim):
+                        # there is an SPD learning rate matrix for every non-trivial
+                        # dimension of each tensor.
+                        size = p.shape[dim]
+                        if size == 1:
+                            continue
+                        state[f"lr_{dim}"] = torch.eye(size, **kwargs)
 
-                            state[f"lr_{dim}"] = torch.eye(size, **kwargs)
-
-                            # grad_cov_{dim} is the covariance of gradients on this axis,
-                            # treating all other axes as as a batch axis.  This is needed
-                            # only for purposes of computing the scalar factor on the
-                            # learning rate; and, as a result of this, also contributes something
-                            # to the gradient w.r.t. f"lr_{dim}", which is one reason
-                            # why we allocate a variable to keep track of its moving average
-                            # instead of just using a temporary and smoothing the scalar factor.
-                            state[f"grad_cov_{dim}"] = torch.zeros(size, size, **kwargs)
-                    else:
-                        # size <= small_tensor_cutoff: do a form of Adam
-                        state["exp_avg_sq"] = torch.zeros_like(p,
-                                                               mamory_format=preserve_memory_format)
 
 
                 step = state["step"]
-
                 numel = p.numel()
-                if numel > 1:
+                delta = state["delta"]
+                delta.mul_(beta1)
+                if numel > 1 and False:
                     # Update the size/scale of p, and set param_rms
                     scale_grads = state["scale_grads"]
                     scale_grads[step % size_update_period] = (p * grad).sum()
@@ -192,23 +188,22 @@ class LearnedGradient(Optimizer):
                         # expanding it.
                         param_rms = state["param_rms"]
                         param_rms.copy_((p ** 2).mean().sqrt().clamp_(min=eps))
-                        if step > 0:
-                            self._size_update(p, state,
-                                              param_rms, scale_grads,
-                                              beta1, beta2, step, size_lr,
-                                              param_min_rms, param_max_rms)
+                        self._size_update(p, state,
+                                          param_rms, scale_grads,
+                                          beta1, beta2, step, size_lr,
+                                          param_min_rms, param_max_rms)
 
-                if numel <= small_tensor_cutoff:
-                    # For parameters with very few elements we just use a form
-                    # of Adam with a scale factor to reflect the overall
-                    # parameter rms.
-                    self._step_small(beta1, beta2, eps, lr, p, grad, state)
-                else:
-                    if step % lr_est_period == 0 and step > 0:
+                    if lr_est_period == 1:
                         self._update_lrs(group, p, grad, state)
-                    self._step(group, p, grad, state)
-
+                    else:
+                        cached_grad = state["cached_grad"]
+                        cached_grad.add_(grad)
+                        if step % lr_est_period == lr_est_period - 1:
+                            self._update_lrs(group, p, cached_grad, state)
+                            cached_grad.zero_()
+                self._step(group, p, grad, state)
                 state["step"] = step + 1
+
 
         return loss
 
@@ -248,19 +243,14 @@ class LearnedGradient(Optimizer):
         # products (p * grad).sum() for the `size_update_period` most recent steps
         size_update_period, = scale_grads.shape
 
-        # correct beta1 and beta2 for the size update period: we will have
-        # faster decay at this level.  The same for the learning rate.
-        beta1_corr = beta1 ** size_update_period
+        # correct beta2 for the size update period; we will have faster decay at
+        # this level.
         beta2_corr = beta2 ** size_update_period
-        size_lr_corr = size_lr * size_update_period
 
         scale_exp_avg_sq = state["scale_exp_avg_sq"]
+
         scale_exp_avg_sq.mul_(beta2_corr).add_(
             (scale_grads ** 2).mean(), alpha=1-beta2_corr)
-
-        scale_exp_avg = state["scale_exp_avg"]
-        scale_exp_avg.mul_(beta1_corr).add_(
-            scale_grads.mean(), alpha=1-beta1_corr)
 
         # The 1st time we reach here is when size_step == 1.
         size_step = (step + 1) // size_update_period
@@ -271,15 +261,25 @@ class LearnedGradient(Optimizer):
         eps = 1.0e-10  # this value is not critical.
         denom = scale_exp_avg_sq.sqrt() + eps
 
-        scale_step = -size_lr_corr * (bias_correction2 ** 0.5) * scale_exp_avg / denom
+        scale_deriv = scale_grads.sum()
+
+        scale_step = -size_lr * (bias_correction2 ** 0.5) * scale_deriv / denom
 
         is_too_small = (param_rms < param_min_rms)
         is_too_large = (param_rms > param_max_rms)
 
-        scale_step.masked_fill_(is_too_small, size_lr_corr)
-        scale_step.masked_fill_(is_too_large, -size_lr_corr)
+        # the values below, +- size_lr * size_update_period, are the maximal/minimal values that
+        # scale_step could have in the regular update
+        scale_step.masked_fill_(is_too_small, size_lr * size_update_period)
+        scale_step.masked_fill_(is_too_large, -size_lr * size_update_period)
 
-        p.add_(p, alpha=scale_step)
+        # in the decomposition p = p_norm * scale.exp(), scale_step would be the change
+        # in `scale`
+
+        # Will later do p.add_(delta), and every (real) iter, will decay
+        # delta by beta1 for every real iter.
+        delta = state["delta"]
+        delta.add_(p, alpha=scale_step*(1-beta1))
 
 
     def _update_lrs(self,
@@ -291,23 +291,19 @@ class LearnedGradient(Optimizer):
         Updates the learning-rate matrices state["lr_{dim}"].
         Args:
           group: dict to look up configuration values
-               p:  current parameter that we are updating
-           grad:  current gradient for the parameter that we are updating
+              p:  current parameter that we are updating
+           grad:  current gradient for the parameter that we are updating.
+                 This may be accumulated across multiple steps.
           state: state dict for the current parameter
         """
-        # meta_lr is the learning rate for the learning rate matrix.
-        meta_lr = group["lr"] * group["meta_lr_scale"]
-        beta1, beta2 = group["betas"]
-        eps = group["eps"]
+        # meta_lr is the learning rate for the learning rate matrix.  The factor
+        # (group["lr_est_period"] ** 0.5) is an approximate attempt to make the speed of
+        # learning the learning-rate matrices independent ff lr_est_period; this formula
+        # would be valid if the derivatives A_deriv that we finally normalize are dominated
+        # by noise, and hence largely independent across minibatches.
+        meta_lr = group["lr"] * group["meta_lr_scale"] * (group["lr_est_period"] ** 0.5)
 
-        ndim = grad.ndim
-
-        # Update grad_cov.
-        # Now no longer needed.
-        # self._store_grad_stats(grad, state, beta2)
-
-
-        for dim in range(ndim):
+        for dim in range(grad.ndim):
             if grad.shape[dim] != 1:
                 self._update_lr(dim, p, grad, state[f"lr_{dim}"], meta_lr)
 
@@ -319,8 +315,17 @@ class LearnedGradient(Optimizer):
                    meta_lr: float) -> None:
         """
         Do one step of update for learning rate matrix 'lr_mat'.
-           TODO: document.
-                meta_lr: The speed with which we learn lr_mat.
+
+        Args:
+               dim: the dimension of the parameter tensor corresponding to the
+                   lr matrix we are updating
+                p: the parameter being updated (this function does not update it)
+                grad: the gradient on this step (may actually be accumulated over
+                   several steps)
+                lr_mat:  the symmetric positive-definite learning-rate matrix
+                   for this dimension of the tensor; stays normalized to have
+                   mean of diagonal equals 1.0.
+                meta_lr: The learning rate for learning the learning-rate matrix.
         """
 
         p = p.transpose(dim, -1)
@@ -333,12 +338,6 @@ class LearnedGradient(Optimizer):
         # directions], although the noisy gradients may be asymmetric.
         grad = -(prod + prod.t())
 
-
-        if random.random() < 0.01:  # Disable this check, no longer valid mathematically buty for info.
-            # A check.
-            inner = (grad * lr_mat).sum() / ((grad ** 2).sum() * (lr_mat ** 2).sum()).sqrt()
-            if inner.abs() > 0.05:
-                logging.info(f"Info: inner product of lr with grad is {inner}, should be zero; dim is {lr_mat.shape[0]}")
 
         # OK. suppose lr_mat = M, which is symmetric positive definite.
         # Decompose: M = A N A^T
@@ -354,7 +353,6 @@ class LearnedGradient(Optimizer):
         #                         =  (M_grad + M_grad^T) N.
         #                         = (M_grad + M_grad^T) M, since N numerically equals M.
         A_grad = torch.matmul(grad + grad.t(), lr_mat)
-
 
         # Normalize the size of `A_grad` (there are arbitrary scalar factors in this loss function),
         # and include meta_lr
@@ -385,10 +383,10 @@ class LearnedGradient(Optimizer):
               grad: Tensor,
               state: dict):
         """
-        This function does the core update of self._step, in the case where the tensor
-        has more than about 5 elements.  It multiplies the moving-average gradient tensor by a
-        state["lr_{dim}"] on each non-trivial axis/dimension, does a length normalization,
-        and takes a step in that direction.
+        This function does the core update of self.step().
+        It multiplies the moving-average gradient tensor by a
+        state["lr_{dim}"] on each non-trivial axis/dimension, does a length normalization based
+        on a moving-average scalar sum-of-squares, and takes a step in that direction.
 
         Args:
             group: A dict which will be used to look up configuration values
@@ -396,105 +394,44 @@ class LearnedGradient(Optimizer):
              grad: The grad of p
             state: The state-dict corresponding to parameter p
 
-        This function modifies p.
+        This function modifies p and elements of `state`.
         """
         lr = group["lr"]
-        beta1 = group["betas"][0]
+        beta1, beta2 = group["betas"]
         eps = group["eps"]
         max_step_scale = group["max_step_scale"]
-
-        moving_g = state["exp_avg"]
-        # include the current grad in moving_g
-        moving_g.mul_(beta1).add_(grad, alpha=(1-beta1))
+        step = state["step"]
 
         # get the parameter delta (up to a scalar factor) by multiplying by a
         # learning-rate matrix for each dimension.
-        moving_d = self._multiply_by_lr(moving_g, state)
+        this_delta = self._multiply_by_lr(grad, state)
 
-        # moving_d contains a moving average of parameter change contributions
-        # from multiple iterations with weights: (1-beta) * (1 + beta + beta^2 +
-        # beta^3, etc.), which sum to 1 for large step.  Suppose the rms value
-        # of each individual gradient were r.  Assuming the terms are
-        # independent, with rms=r, the variance of the elements of moving_d
-        # would be r^2 * (1-beta)^2 * (1 + beta^2 + beta^4 + ... ) which equals
-        # r^2 * (1-beta)^2 / (1-beta^2), so the measured rms of moving_d would
-        # be moving_d_rms = individual_d_rms * (1-beta) / sqrt(1-beta^2), so
-        # individual_d_rms = moving_d_rms * sqrt(1-beta^2) / (1-beta) ... this
-        # would be the root-mean-square value of the individual deltas, if we
-        # were to proces them individually (if they were independent), and this
-        # is what we want to normalize by for greater independence of the beta
-        # value, i.e. so beta only affects momentum and not the overall speed
-        moving_d_rms = (moving_d**2).mean().sqrt() + eps
+        exp_avg_sq = state["exp_avg_sq"]   # A scalar!
+        exp_avg_sq.mul_(beta2).add_((this_delta**2).mean(), alpha=1-beta2)
+        bias_correction2 = 1 - beta2 ** (step + 1)
 
-        # e.g. if beta1==0.98, this formula gives a factor of 9.95, reflecting
-        # that the individual rms's of the un-scaled parameter deltas without
-        # momentum are larger than their moving average.  see the justification
-        # in a comment above.
-        d_rms = moving_d_rms * (((1 - beta1 * beta1) ** 0.5) / (1 - beta1))
-        param_rms = state["param_rms"]
-        alpha = -lr * param_rms / d_rms
+        delta_rms = (exp_avg_sq / bias_correction2).sqrt() + eps
+
 
         # apply max_step_scale to limit magnitude of change on individual
         # elements, this should help stability.
-        limit = moving_d_rms * max_step_scale
-        moving_d_clamped = moving_d.clamp(min=-limit, max=limit)
+        # TODO: see if this is really necessary.
+        limit = delta_rms * max_step_scale
+        this_delta_clamped = this_delta.clamp(min=-limit, max=limit)
 
         if random.random() < 0.001:
-            clamp_diff_rms = ((moving_d_clamped - moving_d) ** 2).mean().sqrt()
-            rel_clamp_diff = clamp_diff_rms / d_rms
-            logging.info(f"Clamping difference is {clamp_diff_rms.item():.3g} vs. {d_rms.item():.3g}: "
+            clamp_diff_rms = ((this_delta_clamped - this_delta) ** 2).mean().sqrt()
+            rel_clamp_diff = clamp_diff_rms / delta_rms
+            logging.info(f"Clamping difference is {clamp_diff_rms.item():.3g} vs. {delta_rms.item():.3g}: "
                          f"relative diff {rel_clamp_diff.item():.3g}, shape={tuple(p.shape)}")
 
-        p.add_(moving_d_clamped, alpha=alpha)
+        delta = state["delta"]
+        alpha = -lr * (1-beta1) * state["param_rms"] / delta_rms
 
-    def _step_small(self,
-                    beta1: float,
-                    beta2: float,
-                    eps: float,
-                    lr: float,
-                    p: Tensor,
-                    grad: Tensor,
-                    state: dict):
-        """
-        A form of the core update for tensors with a small number of elements, e.g. <5.  This is
-        Adam where, if the numel() > 1, the learning rate is proportional to the parameter rms value.
-        """
-        exp_avg = state["exp_avg"]
-        exp_avg_sq = state["exp_avg_sq"]
-        exp_avg.mul_(beta1).add_(grad, alpha=1-beta1)
-        exp_avg_sq.mul_(beta2).addcmul_(grad, grad,
-                                        value=1-beta2)
+        # we multiplied delta by beta1 in step().
+        delta.add_(this_delta_clamped, alpha=alpha)
+        p.add_(delta)
 
-        # bias_correction2 is like in Adam.  Don't bother with bias_correction1;
-        # slower update at the start will help stability anyway.
-        bias_correction2 = 1 - beta2 ** (state["step"] + 1)
-        denom = (exp_avg_sq.sum() / (exp_avg_sq.numel() * bias_correction2)).sqrt() + eps
-        alpha = -lr / denom
-        if p.numel() > 1:
-            alpha = alpha * state["param_rms"]
-        p.add_(exp_avg, alpha=alpha)
-
-
-    def _store_grad_stats(self,
-                          grad: Tensor,
-                          state: dict,
-                          beta2: float) -> None:
-        """
-        Accumulate some stats for each dimension of the tensor, about the covariance of gradients.
-        The stats are just summed, not decayed, as the scalar factor will be normalized out later.
-        """
-        ndim = grad.ndim
-        kwargs = {'device': grad.device, 'dtype': grad.dtype}
-        for dim in range(ndim):
-            size = grad.shape[dim]
-            if size == 1:
-                continue
-            grad_cov = state[f"grad_cov_{dim}"]
-            g = grad.transpose(dim, -1)
-            g = g.reshape(-1, g.shape[-1])
-            # We don't care about the scalar factor, we will normalize when we
-            # use it.
-            grad_cov.mul_(beta2).add_(torch.matmul(g.t(), g))
 
 
     def _multiply_by_lr(self,
@@ -1206,8 +1143,8 @@ def _test_eve_cain():
 
         if iter == 0: optim = Eve(m.parameters(), lr=0.003)
         elif iter == 1: optim = Cain(m.parameters(), lr=0.03)
-        elif iter == 2: optim = LearnedGradient(m.parameters(), lr=0.1)
-        elif iter == 3: optim = LearnedGradient(m.parameters(), lr=0.1)
+        elif iter == 2: optim = LearnedGradient(m.parameters(), lr=0.03)
+        elif iter == 3: optim = LearnedGradient(m.parameters(), lr=0.03)
         scheduler = Eden(optim, lr_batches=200, lr_epochs=5, verbose=False)
 
         start = timeit.default_timer()
