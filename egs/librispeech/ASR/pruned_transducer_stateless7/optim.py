@@ -64,8 +64,8 @@ class LearnedGradient(Optimizer):
             eps=1.0e-08,
             param_min_rms=1.0e-05,
             param_max_rms=2.0,
-            lr_est_period=2,  # TODO: increase.
-            max_step_scale=2.0
+            lr_est_period=1,
+            max_step_scale=10.0
     ):
 
 
@@ -146,13 +146,6 @@ class LearnedGradient(Optimizer):
                     state["delta"] = torch.zeros_like(
                         p, memory_format=torch.preserve_format
                     )
-                    if p.numel() > 1 and lr_est_period > 1:
-                        # cached_grad is a summed version of the raw grad that
-                        # is stored until lr_est_period, and then zeroed. after
-                        # self._update_lrs().
-                        state["cached_grad"] = torch.zeros_like(
-                            p, memory_format=torch.preserve_format
-                        )
 
                     # The scalar exp_avg_sq helps determine the scalar factor in
                     # the learning rate for this tensor, it's a mean of the
@@ -179,7 +172,7 @@ class LearnedGradient(Optimizer):
                 numel = p.numel()
                 delta = state["delta"]
                 delta.mul_(beta1)
-                if numel > 1 and False:
+                if numel > 1:
                     # Update the size/scale of p, and set param_rms
                     scale_grads = state["scale_grads"]
                     scale_grads[step % size_update_period] = (p * grad).sum()
@@ -193,14 +186,9 @@ class LearnedGradient(Optimizer):
                                           beta1, beta2, step, size_lr,
                                           param_min_rms, param_max_rms)
 
-                    if lr_est_period == 1:
+                    if step % lr_est_period == 0:
                         self._update_lrs(group, p, grad, state)
-                    else:
-                        cached_grad = state["cached_grad"]
-                        cached_grad.add_(grad)
-                        if step % lr_est_period == lr_est_period - 1:
-                            self._update_lrs(group, p, cached_grad, state)
-                            cached_grad.zero_()
+
                 self._step(group, p, grad, state)
                 state["step"] = step + 1
 
@@ -296,12 +284,8 @@ class LearnedGradient(Optimizer):
                  This may be accumulated across multiple steps.
           state: state dict for the current parameter
         """
-        # meta_lr is the learning rate for the learning rate matrix.  The factor
-        # (group["lr_est_period"] ** 0.5) is an approximate attempt to make the speed of
-        # learning the learning-rate matrices independent ff lr_est_period; this formula
-        # would be valid if the derivatives A_deriv that we finally normalize are dominated
-        # by noise, and hence largely independent across minibatches.
-        meta_lr = group["lr"] * group["meta_lr_scale"] * (group["lr_est_period"] ** 0.5)
+        # meta_lr is the learning rate for the learning rate matrix.
+        meta_lr = group["lr"] * group["meta_lr_scale"]
 
         for dim in range(grad.ndim):
             if grad.shape[dim] != 1:
