@@ -311,7 +311,9 @@ class LearnedGradient(Optimizer):
                    mean of diagonal equals 1.0.
                 meta_lr: The learning rate for learning the learning-rate matrix.
         """
-
+        shape = p.shape
+        if p.shape[dim] == p.numel():
+            return # TEMP.  Don't do this on e.g. biases.
         p = p.transpose(dim, -1)
         p = p.reshape(-1, p.shape[-1])
         grad = grad.transpose(dim, -1)
@@ -349,6 +351,11 @@ class LearnedGradient(Optimizer):
         size = A_grad.shape[0]
         A = torch.eye(size, device=A_grad.device, dtype=A_grad.dtype) +  A_grad
 
+        #if random.random() < 0.01:
+        #    _, S, _ = A_grad.svd()
+        #    print(f"A_grad eigs, should be <1.0: dim = {dim}, size={lr_mat.shape[0]}, lr_mat eigs = {S[::3]}")
+
+
         # the result is positive semidefinite if the initial LR_mat was positive semidefinite,
         # because it is of the form X X^T where X =  A lr_mat^{0.5}
         torch.matmul(A, torch.matmul(lr_mat, A.t()), out=lr_mat)
@@ -357,8 +364,10 @@ class LearnedGradient(Optimizer):
         # Also ensure it is perfectly symmetric, or it may drift away from symmetry due to
         # roundoff.
         lr_mat[:] = (lr_mat + lr_mat.t()) / (2.0 * lr_mat.diag().mean())
-        #if random.random() < 0.01:
-        #    print("lr_mat = ", lr_mat)
+
+        if random.random() < 0.01:
+            _, S, _ = lr_mat.svd()
+            print(f"shape = {tuple(shape)}, dim = {dim}, size={lr_mat.shape[0]}, lr_mat eigs = {S[::3]}")
 
 
     def _step(self,
@@ -1115,7 +1124,7 @@ def _test_eve_cain():
     input_magnitudes = (1.0 * torch.randn(E, dtype=dtype, device=device)).exp()
     output_magnitudes = (1.0 * torch.randn(E, dtype=dtype, device=device)).exp()
 
-    for iter in [3, 2, 1, 0]:
+    for iter in [0, 3, 2]: #, 2, 1, 0]:
         fix_random_seed(42)
         Linear = torch.nn.Linear if iter == 0 else ScaledLinear
         m = torch.nn.Sequential(Linear(E, 200),
@@ -1123,17 +1132,17 @@ def _test_eve_cain():
                                 Linear(200, E)).to(device)
 
         train_pairs = [ (100.0 * torch.randn(B, T, E, device=device, dtype=dtype) * input_magnitudes,
-                         torch.randn(B, T, E, device=device, dtype=dtype) * output_magnitudes) for _ in range(20) ]
+                         torch.randn(B, T, E, device=device, dtype=dtype) * output_magnitudes) for _ in range(100) ]
 
         if iter == 0: optim = Eve(m.parameters(), lr=0.003)
         elif iter == 1: optim = Cain(m.parameters(), lr=0.03)
-        elif iter == 2: optim = LearnedGradient(m.parameters(), lr=0.03)
+        elif iter == 2: optim = LearnedGradient(m.parameters(), lr=0.03, meta_lr_scale=0.0)
         elif iter == 3: optim = LearnedGradient(m.parameters(), lr=0.03)
         scheduler = Eden(optim, lr_batches=200, lr_epochs=5, verbose=False)
 
         start = timeit.default_timer()
         avg_loss = 0.0
-        for epoch in range(150):
+        for epoch in range(50):
             scheduler.step_epoch()
 
             if epoch == 130:
@@ -1150,7 +1159,7 @@ def _test_eve_cain():
                     avg_loss = loss.item()
                 else:
                     avg_loss = 0.95 * avg_loss + 0.05 * loss.item()
-                if n == 0 and epoch % 10 == 0:
+                if n == 0 and epoch % 5 == 0:
                     norm1 = '%.2e' % (m[0].weight**2).mean().sqrt().item()
                     norm1b = '%.2e' % (m[0].bias**2).mean().sqrt().item()
                     norm2 = '%.2e' % (m[2].weight**2).mean().sqrt().item()
