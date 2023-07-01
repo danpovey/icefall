@@ -148,7 +148,7 @@ class ScaledAdam(BatchedOptimizer):
             betas: beta1,beta2 are momentum constants for regular momentum, and moving sum-sq grad.
                    Must satisfy 0 < beta <= beta2 < 1.
      scalar_lr_scale: A scaling factor on the learning rate, that we use to update the
-                   scale of each parameter tensor and scalar parameters of the mode..
+                   scale of each parameter tensor and scalar parameters of the model.
                    If each parameter were decomposed
                    as p * p_scale.exp(), where (p**2).mean().sqrt() == 1.0, scalar_lr_scale
                    would be a the scaling factor on the learning rate of p_scale.
@@ -164,7 +164,9 @@ class ScaledAdam(BatchedOptimizer):
     size_update_period: The periodicity, in steps, with which we update the size (scale)
                    of the parameter tensor.  This is provided to save a little time
                    in the update.
-     clipping_update_period: if clipping_scale is specified, this is the period
+     clipping_update_period: if clipping_scale is specified, this is the period with which
+                   we re-estimate the median gradient scale for purposes of gradient
+                   clipping.
     """
 
     def __init__(
@@ -197,12 +199,13 @@ class ScaledAdam(BatchedOptimizer):
 
         # If params only contains parameters or group of parameters,
         # i.e when parameter names are not given,
-        # this flag will be set to False in funciton _get_names_of_parameters.
+        # this flag may be set to False in funciton _get_names_of_parameters.
         self.show_dominant_parameters = True
-        param_groups, parameters_names = self._get_names_of_parameters(params)
+
+        param_groups, parameter_names = self._get_names_of_parameters(params)
         super(ScaledAdam, self).__init__(param_groups, defaults)
-        assert len(self.param_groups) == len(parameters_names)
-        self.parameters_names = parameters_names
+        assert len(self.param_groups) == len(parameter_names)
+        self.parameter_names = parameter_names
 
     def _get_names_of_parameters(
         self, params_or_named_params
@@ -332,7 +335,7 @@ class ScaledAdam(BatchedOptimizer):
 
         batch = True
 
-        for group, group_params_names in zip(self.param_groups, self.parameters_names):
+        for group, group_params_names in zip(self.param_groups, self.parameter_names):
 
             with self.batched_params(group["params"], group_params_names) as batches:
 
@@ -391,7 +394,6 @@ class ScaledAdam(BatchedOptimizer):
 
         batch_size = p.shape[0]
         numel = p.numel() // batch_size
-        numel = p.numel()
 
         if numel > 1:
             # "param_rms" just periodically records the scalar root-mean-square value of
@@ -743,6 +745,959 @@ class ScaledAdam(BatchedOptimizer):
         delta.add_(grad / denom, alpha=-lr * (1 - beta1))
         p.clamp_(min=-scalar_max, max=scalar_max)
         p.add_(delta)
+
+
+class FFSAdam(BatchedOptimizer):
+    """
+    Implements Fixed-point Factored Scaled Adam, or FFSAdam.
+
+    - Adam is like the popular optimizer Adam, which is stochastic gradient descent
+      with momentum and dividing by the sqrt(moving-average-sqare) of the per-parameter
+      gradient.
+    - "Scaled" is as in ScaledAdam, which is like Adam but (a) scales the learning rate
+      by the per-tensor RMS parameter value, and (b) learns the "scale" of the tensor
+      via an extra update term that either grows or shrinks each parameter tensor.
+    - "Factored" is as in AdaFactor, and means: instead of computing the
+      moving-average-square of each parameter, treat each tensor as a matrix
+      (with 1 column if its shape does not permit this) and compute the
+      moving-average-square on the row or column level.  However, unlike AdaFactor
+      we do not remove the momentum.
+    - "Fixed-point" means that we discretize Adam: specifically, the parameter
+      values are discretized with either 4 or 8 bits in order to make model
+      compression not-lossy; and the momentum values are discretized in order to
+      save memory.  Both are stored as int8.  The "master copy" of the parameters
+      is now stored in the optimizer, not in the model; the scaling factor
+      is learned.
+
+
+     Args:
+          params:  The parameters or param_groups to optimize (like other Optimizer subclasses)
+                   Unlike common optimizers, which accept model.parameters() or groups of parameters(),
+                   this optimizer could accept model.named_parameters() or groups of named_parameters().
+                   See comments of function _get_names_of_parameters for its 4 possible cases.
+                   Caution: the parameter values will be changed on initialization, because they
+                   are quantized.  (If they were previously quantized, they should not change very
+                   much).
+       param_bits: A number of bits, 1 <= param_bits <= 8, that determines how many bits are used
+                   to store the parameters.
+  learn_quantization_offset: If true, learn the offset for parameter quantization as well as the
+                   scale.  This is only recommended if you are going to use "affine" rather than
+                   "symmetric" quantization for the parameters; at the time of writing I do not
+                   know what the defaults are with torch's quantization schemes.
+                   We use "symmetric quantization" (x = quantized_x * scale),
+                   so 1-bit quantization cannot work because it would allow only negative parameter
+                   values.  Later we may add the option to have an offset.
+              lr:  The learning rate.  We will typically use a learning rate schedule that starts
+                   at 0.03 and decreases over time, i.e. much higher than other common
+                   optimizers.
+     clipping_scale: (e.g. 2.0)
+                   A scale for gradient-clipping: if specified, the normalized gradients
+                   over the whole model will be clipped to have 2-norm equal to
+                   `clipping_scale` times the median 2-norm over the most recent period
+                   of `clipping_update_period` minibatches.  By "normalized gradients",
+                   we mean after multiplying by the rms parameter value for this tensor
+                   [for non-scalars]; this is appropriate because our update is scaled
+                   by this quantity.
+            betas: beta1,beta2 are momentum constants for regular momentum, and moving sum-sq grad.
+                   Must satisfy 0 < beta <= beta2 < 1.
+     scalar_lr_scale: A scaling factor on the learning rate, that we use to update the
+                   scale of each parameter tensor and scalar parameters of the model.
+                   If each parameter were decomposed
+                   as p * p_scale.exp(), where (p**2).mean().sqrt() == 1.0, scalar_lr_scale
+                   would be a the scaling factor on the learning rate of p_scale.
+              eps:  A general-purpose epsilon to prevent division by zero
+  min_quantization_range: Minimum range of quantization of parameter tensors
+  max_quantization_range: Maximum range of quantization of parameter tensors
+                   learning the scale on the parameters (we'll constrain the rms of each non-scalar
+                   parameter tensor to be <= this value)
+       scalar_max: Maximum absolute value for scalar parameters (applicable if your
+                   model has any parameters with numel() == 1).
+     clipping_update_period: if clipping_scale is specified, this is the period
+    momentum_quantization_scale:  A scale on the magnitude-normalized gradient values,
+                   to use prior to int8 quantization.  Larger values give less
+                   random noise, but will increase the likelihood of clipping.
+    """
+
+    def __init__(
+        self,
+        params,
+        param_bits=8,
+        learn_quantization_offset=False,
+        lr=3e-02,
+        clipping_scale=None,
+        betas=(0.9, 0.98),
+        scalar_lr_scale=0.1,
+        eps=1.0e-08,
+        min_quantization_range=4.0e-05,
+        max_quantization_range=20.0,
+        scalar_max=10.0,
+        size_update_period=4,
+        clipping_update_period=100,
+        momentum_quantization_scale=10.0,
+    ):
+
+        defaults = dict(
+            param_bits=param_bits,
+            learn_quantization_offset=learn_quantization_offset,
+            lr=lr,
+            clipping_scale=clipping_scale,
+            betas=betas,
+            scalar_lr_scale=scalar_lr_scale,
+            eps=eps,
+            min_quantization_range=min_quantization_range
+            max_quantization_range=max_quantization_range
+            scalar_max=scalar_max,
+            size_update_period=size_update_period,
+            clipping_update_period=clipping_update_period,
+            momentum_quantization_scale=momentum_quantization_scale,
+        )
+
+        # If params only contains parameters or group of parameters,
+        # i.e when parameter names are not given,
+        # this flag will be set to False in funciton _get_names_of_parameters.
+        self.show_dominant_parameters = True
+        param_groups, parameter_names = self._get_names_of_parameters(params)
+        super(FFSAdam, self).__init__(param_groups, defaults)
+        assert len(self.param_groups) == len(parameter_names)
+        self.parameter_names = parameter_names
+
+        self.rng_step = 0
+
+    def _get_names_of_parameters(
+        self, params_or_named_params
+    ) -> Tuple[List[Dict], List[List[str]]]:
+        """
+        Args:
+          params_or_named_params: according to the way ScaledAdam is initialized in train.py,
+            this argument could be one of following 4 cases,
+            case 1, a generator of parameter, e.g.:
+              optimizer = ScaledAdam(model.parameters(), lr=params.base_lr, clipping_scale=3.0)
+
+            case 2, a list of parameter groups with different config, e.g.:
+              model_param_groups = [
+                      {'params': model.encoder.parameters(), 'lr': 0.05},
+                      {'params': model.decoder.parameters(), 'lr': 0.01},
+                      {'params': model.joiner.parameters(), 'lr': 0.03},
+                      ]
+              optimizer = ScaledAdam(model_param_groups, lr=params.base_lr, clipping_scale=3.0)
+
+            case 3, a generator of named_parameter, e.g.:
+              optimizer = ScaledAdam(model.named_parameters(), lr=params.base_lr, clipping_scale=3.0)
+
+            case 4, a list of named_parameter groups with different config, e.g.:
+              model_named_param_groups = [
+                      {'named_params': model.encoder.named_parameters(), 'lr': 0.05},
+                      {'named_params': model.decoder.named_parameters(), 'lr': 0.01},
+                      {'named_params': model.joiner.named_parameters(), 'lr': 0.03},
+                      ]
+              optimizer = ScaledAdam(model_named_param_groups, lr=params.base_lr, clipping_scale=3.0)
+
+          For case 1 and case 2, input params is used to initialize the underlying torch.optimizer.
+          For case 3 and case 4, firstly, names and params are extracted from input named_params,
+            then, these extracted params are used to initialize the underlying torch.optimizer,
+            and these extracted names are mainly used by function
+            `_show_gradient_dominating_parameter`
+
+        Returns:
+          Returns a tuple containing 2 elements:
+            - `param_groups` with type List[Dict], each Dict element is a parameter group.
+              An example of `param_groups` could be:
+              [
+                  {'params': `one iterable of Parameter`, 'lr': 0.05},
+                  {'params': `another iterable of Parameter`, 'lr': 0.08},
+                  {'params': `a third iterable of Parameter`, 'lr': 0.1},
+              ]
+            - `param_gruops_names` with type List[List[str]],
+               each `List[str]` is for a group['params'] in param_groups,
+               and each `str` is the name of a parameter.
+               A dummy name "foo" is related to each parameter,
+               if input are params without names, i.e. case 1 or case 2.
+        """
+        # variable naming convention in this function:
+        #   p is short for param.
+        #   np is short for named_param.
+        #   p_or_np is short for param_or_named_param.
+        #   cur is short for current.
+        #   group is a dict, e.g. {'params': iterable of parameter, 'lr': 0.05, other fields}.
+        #   groups is a List[group]
+
+        iterable_or_groups = list(params_or_named_params)
+        if len(iterable_or_groups) == 0:
+            raise ValueError("optimizer got an empty parameter list")
+
+        # The first value of returned tuple.  A list of dicts containing at
+        # least 'params' as a key.
+        param_groups = []
+
+        # The second value of returned tuple,
+        # a List[List[str]], each sub-List is for a group.
+        param_groups_names = []
+
+        if not isinstance(iterable_or_groups[0], dict):
+            # case 1 or case 3,
+            # the input is an iterable of parameter or named parameter.
+            param_iterable_cur_group = []
+            param_names_cur_group = []
+            for p_or_np in iterable_or_groups:
+                if isinstance(p_or_np, tuple):
+                    # case 3
+                    name, param = p_or_np
+                else:
+                    # case 1
+                    assert isinstance(p_or_np, torch.Tensor)
+                    param = p_or_np
+                    # Assign a dummy name as a placeholder
+                    name = "foo"
+                    self.show_dominant_parameters = False
+                param_iterable_cur_group.append(param)
+                param_names_cur_group.append(name)
+            param_groups.append({"params": param_iterable_cur_group})
+            param_groups_names.append(param_names_cur_group)
+        else:
+            # case 2 or case 4
+            # the input is groups of parameter or named parameter.
+            for cur_group in iterable_or_groups:
+                if "params" in cur_group:
+                    for p in cur_group["params"]:
+                        assert isinstance(p, torch.Tensor)
+                    param_groups.append(cur_group)
+                    param_groups_names.append(["foo"] * len(p_list))
+                else:
+                    assert "named_params" in cur_group
+                    name_list = [ x[0] for x in cur_group["named_params"] ]
+                    p_list = [ x[1] for x in cur_group["named_params"] ]
+                    del cur_group["named_params"]
+                    cur_group["params"] = p_list
+                    param_groups.append(cur_group)
+                    param_groups_names.append(name_list)
+
+        return param_groups, param_groups_names
+
+    def __setstate__(self, state):
+        super(FFSAdam, self).__setstate__(state)
+
+    @torch.no_grad()
+    def step(self, closure=None):
+        """Performs a single optimization step.
+
+        Arguments:
+            closure (callable, optional): A closure that reevaluates the model
+                and returns the loss.
+        """
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+
+        batch = True
+
+        # must ensure that all DDP workers use same random number generator inside
+        # the optimizer, or their parameters may get out of sync.
+        rng_state = torch.random.get_rng_state()  # to restore
+        torch.random.manual_seed(self.rng_step)
+        self.rng_step += 1
+
+        for group, group_params_names in zip(self.param_groups, self.parameter_names):
+
+            with self.batched_params(group["params"], group_params_names) as batches:
+
+                # batches is list of pairs (stacked_param, state).  stacked_param is like
+                # a regular parameter, and will have a .grad, but the 1st dim corresponds to
+                # a stacking dim, it is not a real dim.
+
+                if (
+                    len(batches[0][1]) == 0
+                ):  # if len(first state) == 0: not yet initialized
+                    clipping_scale = 1
+                else:
+                    clipping_scale = self._get_clipping_scale(group, batches)
+
+                for p, state, _ in batches:
+                    # Perform optimization step.
+                    # grad is not going to be None, we handled that when creating the batches.
+                    grad = p.grad
+                    if grad.is_sparse:
+                        raise RuntimeError(
+                            "ScaledAdam optimizer does not support sparse gradients"
+                        )
+                    # State initialization
+                    if len(state) == 0:
+                        self._init_state(group, p, state)
+
+                    self._step_one_batch(group, p, state, clipping_scale)
+
+
+        torch.random.set_rng_state(rng_state)
+        return loss
+
+    def _init_state(self, group: dict, p: Tensor, state: dict):
+        """
+        Initializes state dict for parameter 'p'.  Assumes that dim 0 of tensor p
+        is actually the batch dimension, corresponding to batched-together
+        parameters of a given shape.  Note that this may change parameters.
+
+        Args:
+           group: Dict to look up configuration values.
+               p: The parameter that we are initializing the state for
+           state: Dict from string to whatever state we are initializing
+        """
+        size_update_period = group["size_update_period"]
+
+        state["step"] = 0
+
+        kwargs = {"device": p.device, "dtype": p.dtype}
+
+
+        batch_size = p.shape[0]
+        numel = p.numel() // batch_size
+
+        if numel > 1:
+            p_3d = _reshape_as_3d(p)
+            shape3d = list(p_3d.shape)
+            state["shape3d"] = shape3d
+
+            quantized, S = FFSAdam._quantize_params(group, p)
+
+            state["quantized"] = quantized # quantized: same shape as p.
+            state["tick"] = S  # tick size for the quantization, shape: (batch_size, 1, 1, ...)
+
+            # moving-average square of the derivative w.r.t. the log of the
+            # scaling factor S/"tick".
+            state["scale_exp_avg_sq"] = torch.zeros(*S.shape,
+                                                    dtype=torch.float32,
+                                                    device=S.device)
+
+
+            # the following is going to be used for a factored representation of
+            # the exp_avg_sq of Adam: we store sums by row and column, to save
+            # memory.
+            (batch_size, rows, cols) = shape3d
+            # even if grads are float16, store the grad_rms_{rows,cols} as
+            # float32 because they might otherwise very easily overflow.
+            state["grad_sumsq_rows"] = torch.zeros(batch_size, rows, 1,
+                                                   dtype=torch.float32,
+                                                   device=p.device)
+            state["grad_sumsq_cols"] = torch.zeros(batch_size, 1, cols,
+                                                   dtype=torch.float32,
+                                                   device=p.device)
+
+            # 'delta' implements momentum; it represents a desired change
+            # change in parameter value, to be applied gradually.
+            state["delta"] = torch.zeros(*p.shape,
+                                         device=p.device, dtype=int8,
+                                         memory_format=torch.preserve_format)
+
+        else:
+            # For scalar parameters, we just do normal Adam (except we'll also
+            # apply the limit scalar_max to prevent such parameters for getting too
+            # large).  exp_avg_sq is the weighted sum of scaled gradients. as in
+            # Adam.
+            state["exp_avg_sq"] = torch.zeros(*p.shape,
+                                              dtype=torch.float32,
+                                              device=p.device)
+            state["exp_avg"] = torch.zeros_like(*p.shape,
+                                                dtype=torch.float32,
+                                                device=p.device)
+
+
+
+    @staticmethod
+    def _reshape_as_3d(p: Tensor):
+        """
+        Returns a reshaped version of p that has 3 dimensions, interpreted
+        as [batch][row][column], so the returned p would be a batch of matrices.
+        This is to enable the row/column factorization of the 2nd-moments
+        tensor, that is used in Adafactor.
+        """
+        # remove the batch-of-parameter-tensors dim.
+        param_shape = list(p.shape[1:])
+        while param_shape.len < 2:
+            param_shape.append(1)
+        best_metric = float('inf')
+        best_pos = -1
+        def prod(_list):
+            prod = _list[0]
+            for x in _list[1:]:
+                prod *= x
+            return prod
+        for pos in range(1, len(param_shape) - 1):
+            metric = abs(prod(param_shape[:pos]) -
+                         prod(param_shape[pos:]))
+            if metric < best_metric:
+                best_metric = metric
+                best_pos = pos
+        batch_size = p.shape[0]
+        ans = p.reshape(batch_size,
+                        prod(param_shape[:best_pos]),
+                        prod(param_shape[best_pos:]))
+        assert (ans.data_ptr() == p.data_ptr(),
+                "Need to change this code to deal with non-contiguous model params")
+        return ans
+
+
+    @staticmethod
+    def _quantize_params(group: dict,
+                         p: Tensor) -> Tuple[Tensor, Tensor]:
+        """
+        Quantizes the provided batch p of parameter tensors to an unsigned integer
+        of "param_bits" bits, stored in a torch.uint8.  Each original tensor
+        in the batch gets its own (tensor-wide) quantization scale.
+
+        Args:
+          group: dict to look up configuration values
+            p: the tensor to quantize,  which will actually be a batch of
+               parameter tensors; the first dimension is the batch dimension.
+
+        Returns: (quantized, S), where:
+           quantized: a tensor of torch.int8 with the same shape as p
+                   S: a scale, of shape (batch_size, 1, 1, ... ), such that
+                     (quantized * S) is an approximation to p.
+        """
+        assert group["learn_quantization_offset"] == False  # will later implement this.
+        param_bits = group["param_bits"]
+        min_range = group["min_quantization_range"]
+        max_range = group["max_quantization_range"]
+        assert 2 <= param_bits <= 8
+
+        p_max = p.abs().max(dim=list(range(1, len(p.shape))), keepdim=True)
+        p_max = p_max.clamp(min=0.5*min_range, max=0.5*max_range)
+        N = (2 ** (param_bits - 1))
+        S = p_max / N   # S is the "tick size" for quantization.
+        quantized = (p / S).round().clamp(min=-N, max=N-1).to(torch.int8)
+
+        return quantized, S
+
+
+
+
+    def _get_clipping_scale(
+        self, group: dict, tuples: List[Tuple[Tensor, dict, List[str]]]
+    ) -> float:
+        """
+        Returns a scalar factor <= 1.0 that dictates gradient clipping, i.e. we will scale the gradients
+        by this amount before applying the rest of the update.
+
+        Args:
+           group: the parameter group, an item in self.param_groups
+           tuples: a list of tuples of (param, state, param_names)
+                where param is a batched set of parameters,
+                with a .grad (1st dim is batch dim)
+                and state is the state-dict where optimization parameters are kept.
+                param_names is a List[str] while each str is name for a parameter
+                in batched set of parameters "param".
+        """
+        assert len(tuples) >= 1
+        clipping_scale = group["clipping_scale"]
+        (first_p, first_state, _) = tuples[0]
+        step = first_state["step"]
+        if clipping_scale is None or step == 0:
+            # no clipping.  return early on step == 0 because the other
+            # parameters' state won't have been initialized yet.
+            return 1.0
+        clipping_update_period = group["clipping_update_period"]
+
+        tot_sumsq = torch.tensor(0.0, device=first_p.device)
+        for (p, state, param_names) in tuples:
+            grad = p.grad
+            if grad.is_sparse:
+                raise RuntimeError(
+                    "FFSAdam optimizer does not support sparse gradients"
+                )
+            if p.numel() == p.shape[0]:  # a batch of scalars
+                tot_sumsq += (grad**2).sum()  # sum() to change shape [1] to []
+            else:
+                tot_sumsq += ((grad * state["param_rms"]) ** 2).sum()
+
+        tot_norm = tot_sumsq.sqrt()
+        if "model_norms" not in first_state:
+            first_state["model_norms"] = torch.zeros(
+                clipping_update_period, device=p.device
+            )
+        first_state["model_norms"][step % clipping_update_period] = tot_norm
+
+        if step % clipping_update_period == 0:
+            # Print some stats.
+            # We don't reach here if step == 0 because we would have returned
+            # above.
+            sorted_norms = first_state["model_norms"].sort()[0].to("cpu")
+            quartiles = []
+            for n in range(0, 5):
+                index = min(
+                    clipping_update_period - 1, (clipping_update_period // 4) * n
+                )
+                quartiles.append(sorted_norms[index].item())
+
+            median = quartiles[2]
+            threshold = clipping_scale * median
+            first_state["model_norm_threshold"] = threshold
+            percent_clipped = (
+                first_state["num_clipped"] * 100.0 / clipping_update_period
+                if "num_clipped" in first_state
+                else 0.0
+            )
+            first_state["num_clipped"] = 0
+            quartiles = " ".join(["%.3e" % x for x in quartiles])
+            logging.info(
+                f"Clipping_scale={clipping_scale}, grad-norm quartiles {quartiles}, "
+                f"threshold={threshold:.3e}, percent-clipped={percent_clipped:.1f}"
+            )
+
+        if step < clipping_update_period:
+            return 1.0  # We have not yet estimated a norm to clip to.
+        else:
+            try:
+                model_norm_threshold = first_state["model_norm_threshold"]
+            except KeyError:
+                logging.info(
+                    "Warning: model_norm_threshold not in state: possibly "
+                    "you changed config when restarting, adding clipping_scale option?"
+                )
+                return 1.0
+            ans = min(1.0, (model_norm_threshold / (tot_norm + 1.0e-20)).item())
+            if ans < 1.0:
+                first_state["num_clipped"] += 1
+            if ans < 0.1:
+                logging.warn(
+                    f"Scaling gradients by {ans}, model_norm_threshold={model_norm_threshold}"
+                )
+                if self.show_dominant_parameters:
+                    assert p.shape[0] == len(param_names)
+                    self._show_gradient_dominating_parameter(tuples, tot_sumsq)
+            return ans
+
+    def _show_gradient_dominating_parameter(
+        self, tuples: List[Tuple[Tensor, dict, List[str]]], tot_sumsq: Tensor
+    ):
+        """
+        Show information of parameter which dominates tot_sumsq.
+
+        Args:
+           tuples: a list of tuples of (param, state, param_names)
+                where param is a batched set of parameters,
+                with a .grad (1st dim is batch dim)
+                and state is the state-dict where optimization parameters are kept.
+                param_names is a List[str] while each str is name for a parameter
+                in batched set of parameters "param".
+            tot_sumsq: sumsq of all parameters. Though it's could be calculated
+                from tuples, we still pass it to save some time.
+        """
+        all_sumsq_orig = {}
+        for (p, state, batch_param_names) in tuples:
+            # p is a stacked batch parameters.
+            batch_grad = p.grad
+            if p.numel() == p.shape[0]:  # a batch of scalars
+                batch_sumsq_orig = batch_grad**2
+                # Dummy values used by following `zip` statement.
+                batch_rms_orig = torch.ones(p.shape[0])
+            else:
+                batch_rms_orig = state["param_rms"]
+                batch_sumsq_orig = ((batch_grad * batch_rms_orig) ** 2).sum(
+                    dim=list(range(1, batch_grad.ndim))
+                )
+
+            for name, sumsq_orig, rms, grad in zip(
+                batch_param_names, batch_sumsq_orig, batch_rms_orig, batch_grad
+            ):
+
+                proportion_orig = sumsq_orig / tot_sumsq
+                all_sumsq_orig[name] = (proportion_orig, sumsq_orig, rms, grad)
+
+        assert torch.isclose(
+            sum([value[0] for value in all_sumsq_orig.values()]).cpu(),
+            torch.tensor(1.0),
+        )
+        sorted_by_proportion = {
+            k: v
+            for k, v in sorted(
+                all_sumsq_orig.items(), key=lambda item: item[1][0], reverse=True
+            )
+        }
+        dominant_param_name = next(iter(sorted_by_proportion))
+        (
+            dominant_proportion,
+            dominant_sumsq,
+            dominant_rms,
+            dominant_grad,
+        ) = sorted_by_proportion[dominant_param_name]
+        logging.info(
+            f"Parameter dominating tot_sumsq {dominant_param_name}"
+            f" with proportion {dominant_proportion:.2f},"
+            f" where dominant_sumsq=(grad_sumsq*orig_rms_sq)"
+            f"={dominant_sumsq:.3e},"
+            f" grad_sumsq={(dominant_grad**2).sum():.3e},"
+            f" orig_rms_sq={(dominant_rms**2).item():.3e}"
+        )
+
+    def _step_one_batch(
+        self, group: dict, p: Tensor, state: dict, clipping_scale: float
+    ):
+        """
+        Do the step for one parameter, which is actually going to be a batch of
+        `real` parameters, with dim 0 as the batch dim.
+        Args:
+                  group:  dict to look up configuration values
+                    p: parameter to update (actually multiple parameters stacked together
+                       as a batch)
+                  state: state-dict for p, to look up the optimizer state
+        """
+        lr = group["lr"]
+        size_update_period = group["size_update_period"]
+        beta1 = group["betas"][0]
+
+        grad = p.grad
+        if clipping_scale != 1.0:
+            grad = grad * clipping_scale
+        step = state["step"]
+
+        batch_size = p.shape[0]
+        numel = p.numel() // batch_size
+        if numel > 1:
+            # Update the size/scale of p, and set param_rms
+            scale_grads = state["scale_grads"]
+            scale_grads[step % size_update_period] = (p * grad).sum(
+                dim=list(range(1, p.ndim)), keepdim=True
+            )
+            if step % size_update_period == size_update_period - 1:
+                param_rms = state["param_rms"]  # shape: (batch_size, 1, 1, ..)
+                param_rms.copy_(
+                    (p**2).mean(dim=list(range(1, p.ndim)), keepdim=True).sqrt()
+                )
+                if step > 0:
+                    # self._size_update() learns the overall scale on the
+                    # parameter, by shrinking or expanding it.
+                    self._size_update(group, scale_grads, p, state)
+
+        if numel == 1:
+            # For parameters with 1 element we just use regular Adam.
+            # Updates delta.
+            self._step_scalar(group, p, state)
+        else:
+            self._step(group, p, state)
+
+        state["step"] = step + 1
+
+    def _size_update(
+        self, group: dict, scale_grads: Tensor, p: Tensor, state: dict
+    ) -> None:
+        """
+               Called only where p.numel() > 1, this updates the scale of the parameter.
+               If we imagine: p =  underlying_param * scale.exp(), and we are doing
+               gradient descent on underlying param and on scale, this function does the update
+               on `scale`.
+
+               Args:
+              group: dict to look up configuration values
+        scale_grads: a tensor of shape (size_update_period, batch_size, 1, 1,...) containing
+                      grads w.r.t. the scales.
+                  p:  The parameter to update
+               state: The state-dict of p
+        """
+
+        param_rms = state["param_rms"]
+        beta1, beta2 = group["betas"]
+        size_lr = group["lr"] * group["scalar_lr_scale"]
+        min_range = group["min_quantization_range"]
+        max_range = group["max_quantization_range"]
+        eps = group["eps"]
+        step = state["step"]
+        batch_size = p.shape[0]
+
+        size_update_period = scale_grads.shape[0]
+        # correct beta2 for the size update period: we will have
+        # faster decay at this level.
+        beta2_corr = beta2**size_update_period
+
+        scale_exp_avg_sq = state["scale_exp_avg_sq"]  # shape: (batch_size, 1, 1, ..)
+        scale_exp_avg_sq.mul_(beta2_corr).add_(
+            (scale_grads**2).mean(dim=0),  # mean over dim `size_update_period`
+            alpha=1 - beta2_corr,
+        )  # shape is (batch_size, 1, 1, ...)
+
+        # The 1st time we reach here is when size_step == 1.
+        size_step = (step + 1) // size_update_period
+        bias_correction2 = 1 - beta2_corr**size_step
+        # we don't bother with bias_correction1; this will help prevent divergence
+        # at the start of training.
+
+        denom = scale_exp_avg_sq.sqrt() + eps
+
+        scale_step = (
+            -size_lr * (bias_correction2**0.5) * scale_grads.sum(dim=0) / denom
+        )
+
+        is_too_small = param_rms < param_min_rms
+
+        # when the param gets too small, just don't shrink it any further.
+        scale_step.masked_fill_(is_too_small, 0.0)
+
+        # and ensure the parameter rms after update never exceeds param_max_rms.
+        # We have to look at the trained model for parameters at or around the
+        # param_max_rms, because sometimes they can indicate a problem with the
+        # topology or settings.
+        scale_step = torch.minimum(scale_step,
+                                   (param_max_rms - param_rms) / param_rms)
+
+        delta = state["delta"]
+        # the factor of (1-beta1) relates to momentum.
+        delta.add_(p * scale_step, alpha=(1 - beta1))
+
+    def _step(self, group: dict, p: Tensor, state: dict):
+        """
+        This function does the core update of self.step(), in the case where the members of
+        the batch have more than 1 element.
+
+        Args:
+            group: A dict which will be used to look up configuration values
+                p: The parameter to be updated
+            state: The state-dict corresponding to parameter p
+
+        This function modifies p.
+        """
+        grad = p.grad
+        lr = group["lr"]
+        scalar_lr_sale = group["scalar_lr_scale"]
+        beta1, beta2 = group["betas"]
+        eps = group["eps"]
+        min_qrange = group["min_quantization_range"]
+        max_qrange = group["max_quantization_range"]
+        momentum_quantization_scale = group["momentum_quantization_scale"]
+
+        step = state["step"]
+        param_bits = group["param_bits"]
+
+        N = (2 ** (param_bits - 1))
+
+        grad = p.grad.to(torch.float32)
+        p32 = p.to(torch.float32)
+
+        grad_rms = self._get_grad_rms(group, grad, state)
+
+        quantized = state["quantized"]  # of int8 type
+
+        # scale_grad is gradient w.r.t. log of scaling factor "tick".
+        grad_times_param = (grad * p32)
+        scale_grad = grad_times_param.sum(dim=list(range(1, grad.ndim)), keepdim=True)
+
+        scale_exp_avg_sq = state["scale_exp_avg_sq"]
+        scale_exp_avg_sq.mul_(beta2).add_(
+            (scale_grad**2),
+            alpha=1 - beta2,
+        )  # shape is (batch_size, 1, 1, ...)
+        bias_correction2 = 1 - beta2**step
+        if bias_correction2 < 0.99:
+            scale_exp_avg_sq = scale_exp_avg_sq / bias_correction2
+
+        # update the "tick" size parameter
+        scale_step = scale_grad * ((scale_exp_avg_sq + eps) **  -0.5)
+        tick = state["tick"]
+        tick.add_(
+            (scale_step * tick),
+            alpha=-lr*scalar_lr_scale,
+        )
+        tick.clamp_(min=min_qrange / (2.0 ** param_bits),
+                    max=max_qrange / (2.0 ** param_bits))
+
+
+        # Later we may extend it to learn the scale within the integer
+        # part as well, effectively shrinking parameters in directions
+        # that aren't getting gradients.
+        ## `not_extremal` is a mask that says which positions in the
+        ## gradient is not at the edges of the range (we treat these
+        ## as pinned).
+        #not_extremal = (quantized.to(torch.float32) + 0.5).abs() > (N - 1)
+
+        #scale_grad_ne = (grad_times_param * not_extremal).sum(
+        #    dim=list(range(1, grad.ndim)), keepdim=True)
+
+
+        norm_grad = grad * inv_grad_rms
+
+
+        # This copy of delta is a float32, and in its "natural" range, with
+        # expected RMS approximately sqrt(1 / (1-beta1^2), which if beta1=0.9,
+        # would be close to sqrt(5)- assuming i.i.d. gradients.
+        delta = state["delta"].to(torch.float32).mul_(momentum_quantization_scale)
+        delta.add_(norm_grad)
+        # we'll do the multiplication by beta1 implicitly: each time, we
+        # transfer approximately the proportion (1-beta1) of delta to the
+        # parameter, and we subtract that amount (after random quantization)
+        # from `delta`.
+
+
+        # `range_factor` is an approximate scale, see explanation in comment
+        # below.
+        range_factor = 0.5
+
+        # `factor` is what we multiply "delta" by before adding it to "quantized".
+        # It includes:
+        #  - the learning rate "lr"
+        #  - the factor -1 (because we are minimizing the loss)
+        #  - (1 - beta1) which is the proportion of "delta" that we want to transfer to the
+        #    parameters; we'll then subtract this amount from delta after#
+        #    appropriate backward-conversion
+        #  - range_factor: a heuristic factor to make this work with similar
+        #    configuration values to ScaledAdam; it is a rough estimate
+        #    of what the parameter RMS will be reltive to the maximum possible
+        #    value when the discretized value is always -N.
+
+        # Notice that "tick" does not appear in the factors here, by which we
+        # add from delta to `quantized`.  This is because we take "tick * N *
+        # 0.5" to be the RMS values of the parameters.
+        factor1 = lr * range_factor * N
+
+        factor2 = - (1 - beta1)
+
+        quantized_f = quantized.to(torch.float) +  delta * (factor1 * factor2)
+        quantized_new = (quantized_f + torch.rand_like(quantized_f)).round().clamp(
+            min=-N, max=N-1)
+        quantized_delta = quantized_new - quantized_f
+        quantized.copy_(quantized_new.to(torch.int8))
+
+        # the following line is equivalent to:
+        #  delta += randomly_quantize(delta * factor1 * factor2 / factor1)
+        #or:
+        # delta += randomly_quantize(delta * -(1 - beta))
+        # so in expectation it is the same as:
+        #    delta *= 1-(1-beta)
+        # i.e. delta *= beta
+        delta.add_(quantized_delta / factor1)
+
+        # the smallest nonzero value that quantized_delta can have is +-1; and
+        # if factor1 is very small, this is the only value we'll ever see.  We need
+        # to make sure that when we convert this back after quantization, it
+        # does not exceed the range of int8.  The worse-case scenario is when
+        # the "delta" value is -1, which gets quantized to a change of +1 in
+        # the integer index of the parameter, which becomes a change of +X
+        # in "delta", where we require X <= 128, because 1+128 = 127 is
+        # the largest positive integer value that we can have.
+        #
+        # This comes down to the
+        # constraint that:
+        #  momentum_quantization_scale / factor1 <= 128.0
+        #  factor1 >= momentum_quantization_scale / 128.0
+        #  factor1 >= 0.07874
+        # lr * range_factor * N >= 0.078125
+        # e.g. if N is 128:
+        #   lr * 0.5 * 128 >= 0.078125
+        #   lr >= 0.0012207
+        # or if N is 16:
+        #   lr >= 0.00976
+
+
+
+
+        quantized = state["quantized"]
+
+
+        new_quantized = new_quantized.clamp_(min=-N, max=N-1).to(torch.int8)
+        delta_quantized = new_quantized - quantized
+        quantized.copy_(new_quantized)
+
+        delta = delta + delta_quantized * ((momentum_quantization_scale * S) * lr)
+
+
+
+
+
+        exp_avg_sq = state["exp_avg_sq"]
+        exp_avg_sq.mul_(beta2).addcmul_(grad, grad, value=(1 - beta2))
+
+        this_step = state["step"]
+        bias_correction2 = 1 - beta2 ** (this_step + 1)
+        if bias_correction2 < 0.99:
+            # note: not in-place.
+            exp_avg_sq = exp_avg_sq * (1.0 / bias_correction2)
+
+        denom = exp_avg_sq.sqrt()
+        denom += eps
+        grad = grad / denom
+
+        alpha = -lr * (1 - beta1) * state["param_rms"].clamp(min=param_min_rms)
+
+        delta = state["delta"]
+        delta.add_(grad * alpha)
+        p.add_(delta)
+
+
+
+
+    def _get_grad_rms(self, group: dict, grad: Tensor, state: dict):
+        """
+        Get inverse root-mean-square value of gradient (comes from a
+        factored estimate of a batch of same-shaped tensors).
+            group: dict to look up configs
+             grad: a Tensor of type torch.float32, containing grad
+            state: the optimization state for this batch.
+        """
+        shape3d = state["shape3d"]
+        beta1 = group["beta1"]
+        beta2 = group["beta2"]
+        eps = group["eps"]
+        momentum_quantization_scale = group["momentum_quantization_scale"]
+        lr = group["lr"]
+
+        grad3d_sq = grad.reshape(*shape3d) ** 2
+        (batch_size, rows, cols) = grad3d
+        grad_sumsq_rows = state["grad_sumsq_rows"]
+        grad_sumsq_cols = state["grad_sumsq_cols"]
+
+        grad_sumsq_rows.mul_(beta2).add(grad3d_sq.sum(dim=2),
+                                        alpha=1-beta2)
+        grad_sumsq_cols.mul_(beta2).add(grad3d_sq.sum(dim=1),
+                                        alpha=1-beta2)
+
+        if bias_correction2 < 0.99:
+            # note: not in-place.
+            grad_sumsq_rows = grad_sumsq_rows * (1.0 / bias_correction2)
+            # no need to do it on grad_sumsq_cols, we divide by it also.
+
+        # gradsq: (batch_size, rows, cols): a moving-average estimate of the
+        # average squared gradient, per element of the tensor
+        gradsq = (grad_sumsq_rows * (grad_sumsq_cols / grad_sumsq_cols.mean()))
+        gradsq = gradsq.reshape(*grad.shape)
+
+        return (gradsq + eps).sqrt()
+
+
+
+    @staticmethod
+    def _randomly_quantize(x: Tensor) -> Tensor:
+        """
+        Returns x randomly quantized to int32, like .round(), in a way that
+        preserves expectations, i.e. the expected (quantized value) is the same
+        as x.
+        """
+        return (x + torch.rand_like(x)).round().to(torch.int32)
+
+
+
+    def _step_scalar(self, group: dict, p: Tensor, state: dict):
+        """
+        Just use a (slightly simplified) Adam as the core update for scalar tensors,
+        where it does not make sense to separate out a "scale" factor.
+        """
+        beta1, beta2 = group["betas"]
+        scalar_max = group["scalar_max"]
+        eps = group["eps"]
+        scalar_lr = group["lr"] * group["scalar_lr_scale"]
+        # exp_avg and exp_avg_sq are torch.float32, so convert to that
+        # type before update.
+        grad = p.grad.to(torch.float32)
+
+        exp_avg_sq = state["exp_avg_sq"]  # shape: (batch_size,)
+        exp_avg_sq.mul_(beta2).addcmul_(grad, grad, value=1 - beta2)
+
+        # bias_correction2 is like in Adam.  Don't bother with bias_correction1;
+        # having a slower update at the start will help stability anyway.
+        bias_correction2 = 1 - beta2 ** (state["step"] + 1)
+        denom = (exp_avg_sq / bias_correction2).sqrt() + eps
+
+        exp_avg = state["exp_avg"]
+        exp_avg.mul_(beta1).add_(grad)
+
+        p.clamp_(min=-scalar_max, max=scalar_max)
+        p.add_(axp_avg.to(p.dtype), alpha=-scalar_lr)
+
 
 
 class LRScheduler(object):
