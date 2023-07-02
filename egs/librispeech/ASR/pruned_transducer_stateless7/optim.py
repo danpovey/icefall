@@ -1430,7 +1430,7 @@ class FSAdafactor(BatchedOptimizer):
             # update the "scale" size parameter
             scale_norm_grad = scale_grad / (scale_exp_avg_sq + eps).sqrt()
 
-            if random.random() < 0.02:
+            if random.random() < 0.001:
                 print(f"scale_norm_grad rms={(scale_norm_grad**2).mean().sqrt()}")
             scale = state["scale"]
             scale0 = scale.clone()
@@ -1462,89 +1462,108 @@ class FSAdafactor(BatchedOptimizer):
             if random.random() < 0.01:
                 print(f"qrms={state['quantized_rms']}")
 
-        grad_rms = self._get_grad_rms(group, grad, state)
-        # grad_norm should usually have root-mean-square value around 1.
-        grad_norm = grad / grad_rms
 
+        if True:
+            # This block updates "quantized"
+            grad_rms = self._get_grad_rms(group, grad, state)
+            # grad_norm should usually have root-mean-square value around 1.
+            grad_norm = grad / grad_rms
 
-        # normally lr_scale will be quite a bit more than 1, since quantized_rms
-        # will normally be about 2**14 ~ 4000, and lr will normally be in the
-        # range 0.03 to 0.003, i.e. around 1/30 to 1/300, so lr_scale should be
-        # at least around 10, or in an extreme case, say around 2.5 if lr = 0.001.
-        # since 'quantized_delta' normally has a largish dynamic range, then,
-        # we won't normally need to add random noise before quantizing it;
-        # but as a kind of compromise we do add random noise if the lr is smaller
-        # than 0.001: see the if-statement a few lines below.
-        lr_scale = (-lr * state["quantized_rms"])
+            lr_scale = (-lr * state["quantized_rms"])
 
-        quantized_float = quantized.to(torch.float)
+            quantized_float = quantized.to(torch.float)
 
-        # adding -0.5 + torch.rand(..), and later doing round(), is a way to
-        # quantize that preserves expectations, so rounding should not cause
-        # any systematic error, i.e. should not prevent convergence.
-        quantized_delta = (grad_norm * lr_scale)
+            # adding -0.5 + torch.rand(..), and later doing round(), is a way to
+            # quantize that preserves expectations, so rounding should not cause
+            # any systematic error, i.e. should not prevent convergence.
+            quantized_delta = (grad_norm * lr_scale)
 
-        if lr < 0.001:
-            quantized_delta += torch.empty(*p.size, dtype=torch.float32,
-                                           device=p.device).uniform_(-0.5, 0.5)
-            # adding the random noise is kind of pointless if the learning rates
-            # are higher than this.  Actually lr < 0.001 is too small and shouldn't
-            # really be used.
+            # normally lr_scale will be quite a bit more than 1, since quantized_rms
+            # will normally be about 2**14 ~ 4000, and lr will normally be in the
+            # range 0.03 to 0.003, i.e. around 1/30 to 1/300, so lr_scale should be
+            # at least around 10, or in an extreme case, say around 2.5 if lr = 0.001.
+            # since 'quantized_delta' normally has a largish dynamic range, then,
+            # we won't normally need to add random noise before quantizing it;
+            # but as a kind of compromise we do add random noise if the lr is smaller
+            # than 0.001: see the if-statement below.
+            if lr < 0.001:
+                quantized_delta += torch.empty(*p.size, dtype=torch.float32,
+                                               device=p.device).uniform_(-0.5, 0.5)
+                # adding the random noise is kind of pointless if the learning rates
+                # are higher than this.  Actually lr < 0.001 is too small and shouldn't
+                # really be used.
 
-        quantized_float = (quantized.to(torch.float32) + quantized_delta.round()).clamp_(
-            min=-32768, max=32767)
-        quantized.copy_(
-            quantized_float.to(torch.int16)
-        )
+            quantized_float = (quantized.to(torch.float32) + quantized_delta.round()).clamp_(
+                min=-32768, max=32767)
+            quantized.copy_(
+                quantized_float.to(torch.int16)
+            )
 
+        # update p from the internal representation consisting of "quantized"
+        # and "scale".  The update process approximates momentum and handles
+        # discretization with "param_bits" bits.
+        self._update_param(group, p, state, quantized_float)
+
+    def _update_param(self, group: dict, p: Tensor, state: dict, quantized_float: Tensor):
+        """
+        Updates a parameter (actually a batch of same-sized parameters) p.
+        This takes care of discretization to a low number of bits, and also
+        momentum.
+
+        Args:
+          group: dict to look up configuation values
+              p: the Tensor to update the value of
+         state: dict to look up optimization state
+quantized_float: this is a temporary value passed into avoid recomputing it;
+           it's just state["quantized"].to(torch.float32)
+        """
         param_bits = group["param_bits"]
+        beta1 = group["betas"][0]
         Np = 2 ** (param_bits - 1)
-
-        quantized_coarse = (
-            (quantized_float * (2. ** (param_bits - 16)))
-        ).round().clamp_(-Np, Np-1)
 
         scale_coarse = (state["scale"] * (1.0 / Np))
 
-        reconstructed = (quantized_coarse.to(torch.float32) * scale_coarse).to(p.dtype)
+        # interp_coarse has a value between -Np and Np, but it is not
+        # quantized yet.  It will consist of the interpolated value between "p"
+        # and our "internal representation of p", with a momentum-like equation:
+        #        "p = beta1 p + (1-beta1) [our internal representation of p],
 
-        # the next few lines are similar in effect to:
-        #  p.mul_(beta1).add_(reconstructed, alpha=1-beta1) but are intended to
-        #  avoid roundoff problems when p is of type float16.
-        interp = (p.to(torch.float32) * beta1).add_(reconstructed,
-                                                    alpha=1-beta1)
+        # ... but this is all scaled by 1.0 / scale_coarse, so the range is
+        # between about -Np and Np.  We treat this as an expectation.  The idea is
+        # that we pick the discretized value so that it has a certain
+        # expectation, with a formula similar to momentum.  If we assume the
+        # previous "p" had the correct expected value, arising then the new
+        # value will also have the correct expected value, taking the
+        # expectation over all the random numbers we have used from the start of
+        # the updates.
+        interp_coarse = (
+            (quantized_float * (2. ** (param_bits - 16)))
+        )
+        interp_coarse.mul_(1 - beta1).add_(p.to(torch.float32) / scale_coarse,
+                                           alpha=beta1)
 
 
-        assert beta1 <= 0.95
-        # the next few lines are intended to ensure that we convert from float32
-        # to float16 in a way that "preserves expectations", i.e.  the expected
-        # conversion of any given float32 value to float16 is correct, over many
-        # tries.  The reason this matters is that if we have an 8-bit
-        # representation, the value might change by a factor of 1/128; and if
-        # momentum beta1 is 0.95, so 1-beta1 = 0.1, the change in p would be
-        # 0.00078.  This is just less than 2^-10, and 2^-11 is about the limit
-        # of the relative change that could be registered in a float16.  If we
-        # were below
-        if p.dtype == torch.float16 and (param_bits == 8 and beta1 > 0.9):
-            # multiply by (1 += 10^-3); the idea is to simulate
-            # a randomized conversion from float to float16.
-            # float16 has 10 mantissa bits (add an implicit leading
-            # 1 bit).  We could have used += 10^-11 probably.
-            # testing the above concept:
-            # a = torch.ones(1000) * 3.3333333333333
-            # (a.to(torch.float16) - a).mean()
-            # tensor(0.0007)
-            # ((a * torch.empty_like(a).uniform_(0.999, 1.001)).to(torch.float16) - a).mean()
-            # tensor(5.5418e-05)
-            interp *= torch.empty_like(interp).uniform_(
-                0.999, 1.001)
-        elif p.dtype == torch.bfloat16:
-            # google brain's float16 has 3 fewer mantissa bits
-            # than normal float16, so it's more of a problem here.
-            interp *= torch.empty_like(interp).uniform_(
-                0.992, 1.008)
+        coarse_ceil = torch.ceil(interp_coarse)
+        coarse_floor = coarse_ceil - 1
 
-        p.copy_(interp.to(p.dtype))
+        # randomly choose either the "ceil" or the "floor" value -- one above or
+        # one below interp_coarse -- with a probability calculated so the
+        # process has an expected value equal to "interp_coarse"
+        coarse_chosen = torch.where(
+            torch.rand_like(coarse_floor) < (interp_coarse - coarse_floor),
+            coarse_ceil, coarse_floor)
+        # the following limit should rarely be reached.  It is intended to
+        # ensure that we only choose a quantization that could be chosen
+        # by torch's "symmetric quantization" scheme.
+        coarse_chosen.clamp_(min=-Np, max=Np-1)
+
+        p.copy_(coarse_chosen * scale_coarse)
+
+        # we'd have to have a more sophisticated update strategy in bfloat16,
+        # it has only 7 (+ 1 implicit) mantissa bits which is not enough
+        # to avoid bad roundoff problems (the p.copy_ line above would lose
+        # too much precision, making the expectations very inaccurate).
+        assert p.dtype != torch.bfloat16
 
 
     def _get_grad_rms(self, group: dict, grad: Tensor, state: dict):
