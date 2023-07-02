@@ -612,9 +612,9 @@ class ScaledAdam(BatchedOptimizer):
         if numel == 1:
             # For parameters with 1 element we just use regular Adam.
             # Updates delta.
-            self._step_scalar(group, p, state)
+            self._step_scalar(group, p, grad, state)
         else:
-            self._step(group, p, state)
+            self._step(group, p, grad, state)
 
         state["step"] = step + 1
 
@@ -683,7 +683,7 @@ class ScaledAdam(BatchedOptimizer):
         # the factor of (1-beta1) relates to momentum.
         delta.add_(p * scale_step, alpha=(1 - beta1))
 
-    def _step(self, group: dict, p: Tensor, state: dict):
+    def _step(self, group: dict, p: Tensor, grad: Tensor, state: dict):
         """
         This function does the core update of self.step(), in the case where the members of
         the batch have more than 1 element.
@@ -696,7 +696,6 @@ class ScaledAdam(BatchedOptimizer):
 
         This function modifies p.
         """
-        grad = p.grad
         lr = group["lr"]
         beta1, beta2 = group["betas"]
         eps = group["eps"]
@@ -722,7 +721,7 @@ class ScaledAdam(BatchedOptimizer):
         delta.add_(grad * alpha)
         p.add_(delta)
 
-    def _step_scalar(self, group: dict, p: Tensor, state: dict):
+    def _step_scalar(self, group: dict, p: Tensor, grad: Tensor, state: dict):
         """
         A simplified form of the core update for scalar tensors, where we cannot get a good
         estimate of the parameter rms.
@@ -731,7 +730,6 @@ class ScaledAdam(BatchedOptimizer):
         scalar_max = group["scalar_max"]
         eps = group["eps"]
         lr = group["lr"] * group["scalar_lr_scale"]
-        grad = p.grad
 
         exp_avg_sq = state["exp_avg_sq"]  # shape: (batch_size,)
         exp_avg_sq.mul_(beta2).addcmul_(grad, grad, value=1 - beta2)
@@ -747,49 +745,63 @@ class ScaledAdam(BatchedOptimizer):
         p.add_(delta)
 
 
-class FFSAdam(BatchedOptimizer):
-    """
-    Implements Fixed-point Factored Scaled Adam, or FFSAdam.
+class FSAdafactor(BatchedOptimizer):
+    """Implements Fixed-point Scaled Adafactor, or FSAdafactor.  To explain this
+    in terms of well-known methods, it's like this:
 
-    - Adam is like the popular optimizer Adam, which is stochastic gradient descent
-      with momentum and dividing by the sqrt(moving-average-sqare) of the per-parameter
+    - Start off with the popular optimizer Adam, which is stochastic gradient descent
+      but dividing by the sqrt(moving-average-sqare) of the per-parameter
       gradient.
+    - "Factored" is as in AdaFactor https://arxiv.org/abs/1804.04235, and means:
+      instead of computing the moving-average-square of each parameter, treat
+      each tensor as a matrix (with 1 column if its shape does not permit this)
+      and compute the moving-average-square on the row or column level.  Note,
+      in Adafactor they remove the momentum of Adam; we'll speak more about this later.
     - "Scaled" is as in ScaledAdam, which is like Adam but (a) scales the learning rate
       by the per-tensor RMS parameter value, and (b) learns the "scale" of the tensor
       via an extra update term that either grows or shrinks each parameter tensor.
-    - "Factored" is as in AdaFactor, and means: instead of computing the
-      moving-average-square of each parameter, treat each tensor as a matrix
-      (with 1 column if its shape does not permit this) and compute the
-      moving-average-square on the row or column level.  However, unlike AdaFactor
-      we do not remove the momentum.
-    - "Fixed-point" means that we discretize Adam: specifically, the parameter
-      values are discretized with either 4 or 8 bits in order to make model
-      compression not-lossy; and the momentum values are discretized in order to
-      save memory.  Both are stored as int8.  The "master copy" of the parameters
-      is now stored in the optimizer, not in the model; the scaling factor
-      is learned.
+    - "Fixed-point" means that we discretize the parameters
+      with a smallish number of bits, e.g. 4 or 8, and
+      a per-tensor positive scale is stored separately.  The motivation is to have
+      a training method compatible with low-memory on-device storage.
 
+    We don't use standard momentum in this scheme, but we do "approximate" it in
+    the following way.  The optimizer keeps an internal copy of the discretized
+    parameter with higher resolution: 16 bits instead of 4 or 8, and the gradient
+    descent acts on this internal copy.  On each step we convert this to the 4-
+    or 8-bit version by rounding-to-nearest, multiply it by the per-tensor
+    scaling factor, and copy it to the "model's copy" of the parameter (this
+    might be stored as float16).  But this copying operation is done with a
+    randomized mask so that each element is copied with probability (1-beta1),
+    e.g. with beta1=0.9, on each step; otherwise we keep the "model's copy".
+    This is intended to approximate the effect of training with momentum of
+    beta1, as in conventional Adam, to reduce the risk of divergence; but with
+    no additional memory cost.
+
+    For scalar tensors, we don't use the above scheme; we just use conventional
+    Adam, with a reduced learning rate.
+
+    Caution: you should probably call flush() on this optimizer before writing
+    the model to disk; it writes the more-accurate internal representation,
+    which should in general perform a bit better if you are not quantizing or
+    if you are doing model averaging first.
 
      Args:
-          params:  The parameters or param_groups to optimize (like other Optimizer subclasses)
+    named_params:  The parameters or param_groups to optimize (like other Optimizer subclasses)
                    Unlike common optimizers, which accept model.parameters() or groups of parameters(),
-                   this optimizer could accept model.named_parameters() or groups of named_parameters().
+                   this optimizer can also accept model.named_parameters() or groups of named_parameters().
                    See comments of function _get_names_of_parameters for its 4 possible cases.
                    Caution: the parameter values will be changed on initialization, because they
                    are quantized.  (If they were previously quantized, they should not change very
                    much).
-       param_bits: A number of bits, 1 <= param_bits <= 8, that determines how many bits are used
-                   to store the parameters.
-  learn_quantization_offset: If true, learn the offset for parameter quantization as well as the
-                   scale.  This is only recommended if you are going to use "affine" rather than
-                   "symmetric" quantization for the parameters; at the time of writing I do not
-                   know what the defaults are with torch's quantization schemes.
-                   We use "symmetric quantization" (x = quantized_x * scale),
-                   so 1-bit quantization cannot work because it would allow only negative parameter
-                   values.  Later we may add the option to have an offset.
+       param_bits: A number of bits, 1 <= param_bits <= 8, that determines how many bits are
+                   used in the discretized representnation of the parameters.  The idea is
+                   that this will correspond with the number of bits you might use in
+                   production.
               lr:  The learning rate.  We will typically use a learning rate schedule that starts
-                   at 0.03 and decreases over time, i.e. much higher than other common
-                   optimizers.
+                   near 0.03 and decreases over time, i.e. much higher than other common
+                   optimizers.  See the Eve learning rate schedule; the lr should decrease
+                   faster, asymptotically, than for optimizers like Adam.
      clipping_scale: (e.g. 2.0)
                    A scale for gradient-clipping: if specified, the normalized gradients
                    over the whole model will be clipped to have 2-norm equal to
@@ -799,37 +811,37 @@ class FFSAdam(BatchedOptimizer):
                    [for non-scalars]; this is appropriate because our update is scaled
                    by this quantity.
             betas: beta1,beta2 are momentum constants for regular momentum, and moving sum-sq grad.
-                   Must satisfy 0 < beta <= beta2 < 1.
+                   Must satisfy 0 < beta <= beta2 < 1.  Do not set beta1 more than 0.9; this is
+                   related to the precision of float16.
      scalar_lr_scale: A scaling factor on the learning rate, that we use to update the
-                   scale of each parameter tensor and scalar parameters of the model.
+                   scale of each parameter tensor and also any scalar parameters of the model.
                    If each parameter were decomposed
                    as p * p_scale.exp(), where (p**2).mean().sqrt() == 1.0, scalar_lr_scale
                    would be a the scaling factor on the learning rate of p_scale.
               eps:  A general-purpose epsilon to prevent division by zero
-  min_quantization_range: Minimum range of quantization of parameter tensors
-  max_quantization_range: Maximum range of quantization of parameter tensors
-                   learning the scale on the parameters (we'll constrain the rms of each non-scalar
-                   parameter tensor to be <= this value)
+ min_quantization_scale: Minimum range of quantization of parameter tensors, i.e. a limit
+                   on the (max - min) possible quantized value, which limits the learned
+                   per-tensor scaling factor.
+ max_quantization_scale: Maximum range of quantization of parameter tensors, i.e. a limit
+                   on the (max - min) possible quantized value, which limits the learned
+                   per-tensor scaling factor.
        scalar_max: Maximum absolute value for scalar parameters (applicable if your
                    model has any parameters with numel() == 1).
-     clipping_update_period: if clipping_scale is specified, this is the period
-    momentum_quantization_scale:  A scale on the magnitude-normalized gradient values,
-                   to use prior to int8 quantization.  Larger values give less
-                   random noise, but will increase the likelihood of clipping.
-    """
+   clipping_update_period: if clipping_scale is specified, this is the period with
+                   which the median gradient magnitude is re-estimated.
 
+    """
     def __init__(
         self,
         params,
         param_bits=8,
-        learn_quantization_offset=False,
         lr=3e-02,
         clipping_scale=None,
         betas=(0.9, 0.98),
         scalar_lr_scale=0.1,
         eps=1.0e-08,
-        min_quantization_range=4.0e-05,
-        max_quantization_range=20.0,
+        min_quantization_scale=4.0e-05,
+        max_quantization_scale=20.0,
         scalar_max=10.0,
         size_update_period=4,
         clipping_update_period=100,
@@ -838,18 +850,15 @@ class FFSAdam(BatchedOptimizer):
 
         defaults = dict(
             param_bits=param_bits,
-            learn_quantization_offset=learn_quantization_offset,
             lr=lr,
             clipping_scale=clipping_scale,
             betas=betas,
             scalar_lr_scale=scalar_lr_scale,
             eps=eps,
-            min_quantization_range=min_quantization_range
-            max_quantization_range=max_quantization_range
+            min_quantization_scale=min_quantization_scale,
+            max_quantization_scale=max_quantization_scale,
             scalar_max=scalar_max,
-            size_update_period=size_update_period,
             clipping_update_period=clipping_update_period,
-            momentum_quantization_scale=momentum_quantization_scale,
         )
 
         # If params only contains parameters or group of parameters,
@@ -857,7 +866,7 @@ class FFSAdam(BatchedOptimizer):
         # this flag will be set to False in funciton _get_names_of_parameters.
         self.show_dominant_parameters = True
         param_groups, parameter_names = self._get_names_of_parameters(params)
-        super(FFSAdam, self).__init__(param_groups, defaults)
+        super().__init__(param_groups, defaults)
         assert len(self.param_groups) == len(parameter_names)
         self.parameter_names = parameter_names
 
@@ -974,7 +983,18 @@ class FFSAdam(BatchedOptimizer):
         return param_groups, param_groups_names
 
     def __setstate__(self, state):
-        super(FFSAdam, self).__setstate__(state)
+        super(FSAdafactor, self).__setstate__(state)
+
+
+    @torch.no_grad()
+    def flush(self):
+        """Flushes stored state to the model, in preparation for writing the model to disk.
+        This flushes to the model the 16-bit internal representation of the model parameters
+        (scaled by the per-tensor scale); and removes the 16-bit internal representation from
+        the optimizer state, to save space when we write the optimizer state to disk.
+        """
+        # TODO
+        pass
 
     @torch.no_grad()
     def step(self, closure=None):
@@ -993,21 +1013,18 @@ class FFSAdam(BatchedOptimizer):
 
         # must ensure that all DDP workers use same random number generator inside
         # the optimizer, or their parameters may get out of sync.
-        rng_state = torch.random.get_rng_state()  # to restore
+        rng_state = torch.random.get_rng_state()  # to restore it later
         torch.random.manual_seed(self.rng_step)
         self.rng_step += 1
 
         for group, group_params_names in zip(self.param_groups, self.parameter_names):
 
             with self.batched_params(group["params"], group_params_names) as batches:
-
                 # batches is list of pairs (stacked_param, state).  stacked_param is like
                 # a regular parameter, and will have a .grad, but the 1st dim corresponds to
-                # a stacking dim, it is not a real dim.
-
-                if (
-                    len(batches[0][1]) == 0
-                ):  # if len(first state) == 0: not yet initialized
+                # the index within the batch.
+                if len(batches[0][1]) == 0:
+                    # if len(first state) == 0: not yet initialized
                     clipping_scale = 1
                 else:
                     clipping_scale = self._get_clipping_scale(group, batches)
@@ -1020,19 +1037,22 @@ class FFSAdam(BatchedOptimizer):
                         raise RuntimeError(
                             "ScaledAdam optimizer does not support sparse gradients"
                         )
-                    # State initialization
-                    if len(state) == 0:
+                    # State initialization or partial initialization after we called flush().
+                    if "quantized" not in state:
                         self._init_state(group, p, state)
 
                     self._step_one_batch(group, p, state, clipping_scale)
-
 
         torch.random.set_rng_state(rng_state)
         return loss
 
     def _init_state(self, group: dict, p: Tensor, state: dict):
         """
-        Initializes state dict for parameter 'p'.  Assumes that dim 0 of tensor p
+        Initializes, state dict for parameter 'p'.   Also works for initializing
+        only the "quantized" and "scale" values, if they have been removed
+        by calling flush().
+
+        Assumes that dim 0 of tensor p
         is actually the batch dimension, corresponding to batched-together
         parameters of a given shape.  Note that this may change parameters.
 
@@ -1041,9 +1061,8 @@ class FFSAdam(BatchedOptimizer):
                p: The parameter that we are initializing the state for
            state: Dict from string to whatever state we are initializing
         """
-        size_update_period = group["size_update_period"]
 
-        state["step"] = 0
+        state.setdefault("step",  0)
 
         kwargs = {"device": p.device, "dtype": p.dtype}
 
@@ -1054,50 +1073,59 @@ class FFSAdam(BatchedOptimizer):
         if numel > 1:
             p_3d = _reshape_as_3d(p)
             shape3d = list(p_3d.shape)
-            state["shape3d"] = shape3d
+            state.setdefault("shape3d", shape3d)
 
-            quantized, S = FFSAdam._quantize_params(group, p)
+            quantized, scale = FSAdafactor._quantize_params(group, p)
 
             state["quantized"] = quantized # quantized: same shape as p.
-            state["tick"] = S  # tick size for the quantization, shape: (batch_size, 1, 1, ...)
+            state["scale"] = scale  # tick size for the quantization, shape: (batch_size, 1, 1, ...)
+
+            # RMS of "quantized" (in its quantized representation, so this number may be close to 2**15).
+            # This is used as a factor within the learning rate, as in ScaledAdam..
+            # We put a minimum limit of 2**11 on this: so 8 times less than the maximum possible
+            # value.  This should only really be reached in cases where the parameters start off as
+            # zero or extremely close to zero.  We'll apply the same limit when we update this
+            # during training.
+            state["quantized_rms"] = (
+                (quantized ** 2).mean(dim=list(range(1, p.ndim)), keepdim=True).to(torch.float32).sqrt()
+            ).clamp_(min=2**11)
 
             # moving-average square of the derivative w.r.t. the log of the
-            # scaling factor S/"tick".
-            state["scale_exp_avg_sq"] = torch.zeros(*S.shape,
-                                                    dtype=torch.float32,
-                                                    device=S.device)
-
+            # scaling factor `scale`, one per parameter tensor.
+            state.setdefault("scale_exp_avg_sq",
+                             torch.zeros(*S.shape, dtype=torch.float32, device=S.device))
 
             # the following is going to be used for a factored representation of
             # the exp_avg_sq of Adam: we store sums by row and column, to save
             # memory.
             (batch_size, rows, cols) = shape3d
-            # even if grads are float16, store the grad_rms_{rows,cols} as
+            # even if grads are float16, store the grad_sumsq_{rows,cols} as
             # float32 because they might otherwise very easily overflow.
-            state["grad_sumsq_rows"] = torch.zeros(batch_size, rows, 1,
-                                                   dtype=torch.float32,
-                                                   device=p.device)
-            state["grad_sumsq_cols"] = torch.zeros(batch_size, 1, cols,
-                                                   dtype=torch.float32,
-                                                   device=p.device)
-
-            # 'delta' implements momentum; it represents a desired change
-            # change in parameter value, to be applied gradually.
-            state["delta"] = torch.zeros(*p.shape,
-                                         device=p.device, dtype=int8,
-                                         memory_format=torch.preserve_format)
-
+            state.setdefault("grad_sumsq_rows",
+                             torch.zeros(batch_size, rows, 1,
+                                         dtype=torch.float32,
+                                         device=p.device))
+            state.setdefault("grad_sumsq_cols",
+                             torch.zeros(batch_size, 1, cols,
+                                         dtype=torch.float32,
+                                         device=p.device))
         else:
-            # For scalar parameters, we just do normal Adam (except we'll also
-            # apply the limit scalar_max to prevent such parameters for getting too
-            # large).  exp_avg_sq is the weighted sum of scaled gradients. as in
-            # Adam.
-            state["exp_avg_sq"] = torch.zeros(*p.shape,
-                                              dtype=torch.float32,
-                                              device=p.device)
-            state["exp_avg"] = torch.zeros_like(*p.shape,
-                                                dtype=torch.float32,
-                                                device=p.device)
+            # For scalar parameters, we just do something similar to normal
+            # Adam, refactored to be kind to roundoff effects incurred if the
+            # parameter is a float16.  We'll also apply the limit scalar_max to
+            # prevent such parameters for getting too large.  exp_avg_sq is the
+            # weighted sum of scaled gradients. as in Adam.
+            state.setdefault("exp_avg_sq",
+                             torch.zeros(*p.shape,
+                                         dtype=torch.float32,
+                                         device=p.device))
+
+            # "delta" is an intended change to the parameter p, that we
+            # gradually transfer to p as a momentum update.
+            state.setdefault("delta",
+                             torch.zeros(*p.shape,
+                                         dtype=torch.float32,
+                                         device=p.device))
 
 
 
@@ -1130,8 +1158,8 @@ class FFSAdam(BatchedOptimizer):
         ans = p.reshape(batch_size,
                         prod(param_shape[:best_pos]),
                         prod(param_shape[best_pos:]))
-        assert (ans.data_ptr() == p.data_ptr(),
-                "Need to change this code to deal with non-contiguous model params")
+        assert ans.data_ptr() == p.data_ptr(), "Need to change this code to deal with non-contiguous model params"
+
         return ans
 
 
@@ -1139,34 +1167,32 @@ class FFSAdam(BatchedOptimizer):
     def _quantize_params(group: dict,
                          p: Tensor) -> Tuple[Tensor, Tensor]:
         """
-        Quantizes the provided batch p of parameter tensors to an unsigned integer
-        of "param_bits" bits, stored in a torch.uint8.  Each original tensor
-        in the batch gets its own (tensor-wide) quantization scale.
+        Quantizes the provided batch p of parameter tensors to a 16 bit integer,
+        stored as torch.int16.  Each original tensor
+        in the batch gets its own (tensor-wide) quantization scale, which will
+        in the normal case correspond to the maximum absolute value of the tensor.
 
         Args:
           group: dict to look up configuration values
             p: the tensor to quantize,  which will actually be a batch of
                parameter tensors; the first dimension is the batch dimension.
 
-        Returns: (quantized, S), where:
-           quantized: a tensor of torch.int8 with the same shape as p
-                   S: a scale, of shape (batch_size, 1, 1, ... ), such that
-                     (quantized * S) is an approximation to p.
+        Returns: (quantized, scale), where:
+           quantized: a tensor of torch.int16, with the same shape as p
+               scale: a positive scale, of shape (batch_size, 1, 1, ... ), such that
+                      (quantized * scale / (2**15)) is an approximation to p.
         """
-        assert group["learn_quantization_offset"] == False  # will later implement this.
         param_bits = group["param_bits"]
-        min_range = group["min_quantization_range"]
-        max_range = group["max_quantization_range"]
-        assert 2 <= param_bits <= 8
+        min_scale = group["min_quantization_scale"]
+        max_scale = group["max_quantization_scale"]
 
+        N = 2 ** 15
         p_max = p.abs().max(dim=list(range(1, len(p.shape))), keepdim=True)
-        p_max = p_max.clamp(min=0.5*min_range, max=0.5*max_range)
-        N = (2 ** (param_bits - 1))
-        S = p_max / N   # S is the "tick size" for quantization.
-        quantized = (p / S).round().clamp(min=-N, max=N-1).to(torch.int8)
+        scale = p_max.clamp(min=min_scale, max=max_scale)
+        S = scale / N
+        quantized = (p.to(torch.float32) / S).round().clamp(min=-N, max=N-1).to(torch.int16)
 
-        return quantized, S
-
+        return quantized, scale
 
 
 
@@ -1201,7 +1227,7 @@ class FFSAdam(BatchedOptimizer):
             grad = p.grad
             if grad.is_sparse:
                 raise RuntimeError(
-                    "FFSAdam optimizer does not support sparse gradients"
+                    "FSAdafactor optimizer does not support sparse gradients"
                 )
             if p.numel() == p.shape[0]:  # a batch of scalars
                 tot_sumsq += (grad**2).sum()  # sum() to change shape [1] to []
@@ -1340,9 +1366,6 @@ class FFSAdam(BatchedOptimizer):
                        as a batch)
                   state: state-dict for p, to look up the optimizer state
         """
-        lr = group["lr"]
-        size_update_period = group["size_update_period"]
-        beta1 = group["betas"][0]
 
         grad = p.grad
         if clipping_scale != 1.0:
@@ -1351,33 +1374,18 @@ class FFSAdam(BatchedOptimizer):
 
         batch_size = p.shape[0]
         numel = p.numel() // batch_size
-        if numel > 1:
-            # Update the size/scale of p, and set param_rms
-            scale_grads = state["scale_grads"]
-            scale_grads[step % size_update_period] = (p * grad).sum(
-                dim=list(range(1, p.ndim)), keepdim=True
-            )
-            if step % size_update_period == size_update_period - 1:
-                param_rms = state["param_rms"]  # shape: (batch_size, 1, 1, ..)
-                param_rms.copy_(
-                    (p**2).mean(dim=list(range(1, p.ndim)), keepdim=True).sqrt()
-                )
-                if step > 0:
-                    # self._size_update() learns the overall scale on the
-                    # parameter, by shrinking or expanding it.
-                    self._size_update(group, scale_grads, p, state)
 
         if numel == 1:
             # For parameters with 1 element we just use regular Adam.
             # Updates delta.
-            self._step_scalar(group, p, state)
+            self._step_scalar(group, p, grad, state)
         else:
-            self._step(group, p, state)
+            self._step(group, p, grad, state)
 
         state["step"] = step + 1
 
     def _size_update(
-        self, group: dict, scale_grads: Tensor, p: Tensor, state: dict
+            self, group: dict, scale_grads: Tensor, p: Tensor, state: dict
     ) -> None:
         """
                Called only where p.numel() > 1, this updates the scale of the parameter.
@@ -1396,8 +1404,8 @@ class FFSAdam(BatchedOptimizer):
         param_rms = state["param_rms"]
         beta1, beta2 = group["betas"]
         size_lr = group["lr"] * group["scalar_lr_scale"]
-        min_range = group["min_quantization_range"]
-        max_range = group["max_quantization_range"]
+        min_scale = group["min_quantization_scale"]
+        max_scale = group["max_quantization_scale"]
         eps = group["eps"]
         step = state["step"]
         batch_size = p.shape[0]
@@ -1441,7 +1449,7 @@ class FFSAdam(BatchedOptimizer):
         # the factor of (1-beta1) relates to momentum.
         delta.add_(p * scale_step, alpha=(1 - beta1))
 
-    def _step(self, group: dict, p: Tensor, state: dict):
+    def _step(self, group: dict, p: Tensor, grad: Tensor, state: dict):
         """
         This function does the core update of self.step(), in the case where the members of
         the batch have more than 1 element.
@@ -1453,191 +1461,163 @@ class FFSAdam(BatchedOptimizer):
 
         This function modifies p.
         """
-        grad = p.grad
         lr = group["lr"]
         scalar_lr_sale = group["scalar_lr_scale"]
         beta1, beta2 = group["betas"]
         eps = group["eps"]
-        min_qrange = group["min_quantization_range"]
-        max_qrange = group["max_quantization_range"]
-        momentum_quantization_scale = group["momentum_quantization_scale"]
 
         step = state["step"]
-        param_bits = group["param_bits"]
-
-        N = (2 ** (param_bits - 1))
 
         grad = p.grad.to(torch.float32)
         p32 = p.to(torch.float32)
 
+        if True:
+            # This updates the scale.
+            # scale_grad is gradient w.r.t. log of scaling factor "tick".
+            grad_times_param = (grad * p32)
+            scale_grad = grad_times_param.sum(dim=list(range(1, grad.ndim)), keepdim=True)
+
+            scale_exp_avg_sq = state["scale_exp_avg_sq"]
+            scale_exp_avg_sq.mul_(beta2).add_(
+                (scale_grad**2),
+                alpha=1 - beta2,
+            )  # shape is (batch_size, 1, 1, ...)
+            bias_correction2 = 1 - beta2**step
+            if bias_correction2 < 0.99:
+                scale_exp_avg_sq = scale_exp_avg_sq / bias_correction2
+
+            # update the "scale" size parameter
+            scale_norm_grad = scale_grad * ((scale_exp_avg_sq + eps) **  -0.5)
+            scale = state["scale"]
+            scale.add_(
+                (scale_norm_grad * scale),
+                alpha=-lr*scalar_lr_scale,
+            )
+            scale.clamp_(min=group["min_quantization_scale"],
+                         max=group["max_quantization_scale"])
+
+
+        quantized = state["quantized"]  # of int16 type
+
+        if step % 10 == 0:
+            # update quantized_rms every 10 steps.  It should normally be not that much less than
+            # 2 ** 15, e.g. it might be 2 ** 13 or 14, perhaps decreasing as we train.
+            #
+            # quantized_rms is used as a factor within the learning rate, as in
+            # "param_rms" in ScaledAdam.  We put a minimum limit of 2**11 on
+            # this: so 8 times less than the maximum possible value, to ensure
+            # that when the parameters start off near zero we quickly grow the
+            # quantized parameters to a reasonable size.  This should only
+            # really be reached in cases where the parameters start off as zero
+            # or extremely close to zero.  We'll apply the same limit when we
+            # update this during training.
+            state["quantized_rms"] = (
+                (quantized ** 2).mean(dim=list(range(1, p.ndim)), keepdim=True).to(torch.float32).sqrt()
+            ).clamp_(min=2**11)
+
+
         grad_rms = self._get_grad_rms(group, grad, state)
+        # grad_norm should usually have root-mean-square value around 1.
+        grad_norm = grad / grad_rms
 
-        quantized = state["quantized"]  # of int8 type
+        # normally lr_scale will be quite a bit more than 1, since quantized_rms
+        # will normally be about 2**14 ~ 4000, and lr will normally be in the
+        # range 0.03 to 0.003, i.e. around 1/30 to 1/300, so lr_scale should be
+        # at least around 10, or in an extreme case, say around 2.5 if lr = 0.001.
+        # since 'quantized_delta' normally has a largish dynamic range, then,
+        # we won't normally need to add random noise before quantizing it;
+        # but as a kind of compromise we do add random noise if the lr is smaller
+        # than 0.001: see the if-statement a few lines below.
+        lr_scale = (-lr * state["quantized_rms"])
 
-        # scale_grad is gradient w.r.t. log of scaling factor "tick".
-        grad_times_param = (grad * p32)
-        scale_grad = grad_times_param.sum(dim=list(range(1, grad.ndim)), keepdim=True)
+        quantized_float = quantized.to(torch.float)
 
-        scale_exp_avg_sq = state["scale_exp_avg_sq"]
-        scale_exp_avg_sq.mul_(beta2).add_(
-            (scale_grad**2),
-            alpha=1 - beta2,
-        )  # shape is (batch_size, 1, 1, ...)
-        bias_correction2 = 1 - beta2**step
-        if bias_correction2 < 0.99:
-            scale_exp_avg_sq = scale_exp_avg_sq / bias_correction2
+        # adding -0.5 + torch.rand(..), and later doing round(), is a way to
+        # quantize that preserves expectations, so rounding should not cause
+        # any systematic error, i.e. should not prevent convergence.
+        quantized_delta = (grad_norm * lr_scale)
 
-        # update the "tick" size parameter
-        scale_step = scale_grad * ((scale_exp_avg_sq + eps) **  -0.5)
-        tick = state["tick"]
-        tick.add_(
-            (scale_step * tick),
-            alpha=-lr*scalar_lr_scale,
+        if lr < 0.001:
+            quantized_delta += torch.empty(*p.size, dtype=torch.float32,
+                                           device=p.device).uniform_(-0.5, 0.5)
+            # adding the random noise is kind of pointless if the learning rates
+            # are higher than this.  Actually lr < 0.001 is too small and shouldn't
+            # really be used.
+
+        quantized_float = (quantized.to(torch.float32) + quantized_delta.round()).clamp_(
+            min=-32768, max=32767)
+        quantized.copy_(
+            quantized_float.to(torch.int16)
         )
-        tick.clamp_(min=min_qrange / (2.0 ** param_bits),
-                    max=max_qrange / (2.0 ** param_bits))
+
+        param_bits = group["param_bits"]
+        Np = 2 ** (param_bits - 1)
+
+        quantized_coarse = (
+            (quantized_float * (2. ** (param_bits - 16)))
+        ).round().clamp_(-Np, Np-1)
+
+        scale_coarse = (state["scale"] * (1.0 / Np))
+
+        reconstructed = (quantized_coarse.to(torch.float32) * scale_coarse).to(p.dtype)
+
+        # the next few lines are similar in effect to:
+        #  p.mul_(beta1).add_(reconstructed, alpha=1-beta1) but are intended to
+        #  avoid roundoff problems when p is of type float16.
+        interp = (p.to(torch.float32) * beta1).add_(reconstructed,
+                                                    alpha=1-beta1)
 
 
-        # Later we may extend it to learn the scale within the integer
-        # part as well, effectively shrinking parameters in directions
-        # that aren't getting gradients.
-        ## `not_extremal` is a mask that says which positions in the
-        ## gradient is not at the edges of the range (we treat these
-        ## as pinned).
-        #not_extremal = (quantized.to(torch.float32) + 0.5).abs() > (N - 1)
+        assert beta1 <= 0.95
+        # the next few lines are intended to ensure that we convert from float32
+        # to float16 in a way that "preserves expectations", i.e.  the expected
+        # conversion of any given float32 value to float16 is correct, over many
+        # tries.  The reason this matters is that if we have an 8-bit
+        # representation, the value might change by a factor of 1/128; and if
+        # momentum beta1 is 0.95, so 1-beta1 = 0.1, the change in p would be
+        # 0.00078.  This is just less than 2^-10, and 2^-11 is about the limit
+        # of the relative change that could be registered in a float16.  If we
+        # were below
+        if p.dtype == torch.float16 and (param_bits == 8 and beta1 > 0.9):
+            # multiply by (1 += 10^-3); the idea is to simulate
+            # a randomized conversion from float to float16.
+            # float16 has 10 mantissa bits (add an implicit leading
+            # 1 bit).  We could have used += 10^-11 probably.
+            # testing the above concept:
+            # a = torch.ones(1000) * 3.3333333333333
+            # (a.to(torch.float16) - a).mean()
+            # tensor(0.0007)
+            # ((a * torch.empty_like(a).uniform_(0.999, 1.001)).to(torch.float16) - a).mean()
+            # tensor(5.5418e-05)
+            interp *= torch.empty_like(interp).uniform_(
+                0.999, 1.001)
+        elif p.dtype == torch.bfloat16:
+            # google brain's float16 has 3 fewer mantissa bits
+            # than normal float16, so it's more of a problem here.
+            interp *= torch.empty_like(interp).uniform_(
+                0.992, 1.008)
 
-        #scale_grad_ne = (grad_times_param * not_extremal).sum(
-        #    dim=list(range(1, grad.ndim)), keepdim=True)
-
-
-        norm_grad = grad * inv_grad_rms
-
-
-        # This copy of delta is a float32, and in its "natural" range, with
-        # expected RMS approximately sqrt(1 / (1-beta1^2), which if beta1=0.9,
-        # would be close to sqrt(5)- assuming i.i.d. gradients.
-        delta = state["delta"].to(torch.float32).mul_(momentum_quantization_scale)
-        delta.add_(norm_grad)
-        # we'll do the multiplication by beta1 implicitly: each time, we
-        # transfer approximately the proportion (1-beta1) of delta to the
-        # parameter, and we subtract that amount (after random quantization)
-        # from `delta`.
-
-
-        # `range_factor` is an approximate scale, see explanation in comment
-        # below.
-        range_factor = 0.5
-
-        # `factor` is what we multiply "delta" by before adding it to "quantized".
-        # It includes:
-        #  - the learning rate "lr"
-        #  - the factor -1 (because we are minimizing the loss)
-        #  - (1 - beta1) which is the proportion of "delta" that we want to transfer to the
-        #    parameters; we'll then subtract this amount from delta after#
-        #    appropriate backward-conversion
-        #  - range_factor: a heuristic factor to make this work with similar
-        #    configuration values to ScaledAdam; it is a rough estimate
-        #    of what the parameter RMS will be reltive to the maximum possible
-        #    value when the discretized value is always -N.
-
-        # Notice that "tick" does not appear in the factors here, by which we
-        # add from delta to `quantized`.  This is because we take "tick * N *
-        # 0.5" to be the RMS values of the parameters.
-        factor1 = lr * range_factor * N
-
-        factor2 = - (1 - beta1)
-
-        quantized_f = quantized.to(torch.float) +  delta * (factor1 * factor2)
-        quantized_new = (quantized_f + torch.rand_like(quantized_f)).round().clamp(
-            min=-N, max=N-1)
-        quantized_delta = quantized_new - quantized_f
-        quantized.copy_(quantized_new.to(torch.int8))
-
-        # the following line is equivalent to:
-        #  delta += randomly_quantize(delta * factor1 * factor2 / factor1)
-        #or:
-        # delta += randomly_quantize(delta * -(1 - beta))
-        # so in expectation it is the same as:
-        #    delta *= 1-(1-beta)
-        # i.e. delta *= beta
-        delta.add_(quantized_delta / factor1)
-
-        # the smallest nonzero value that quantized_delta can have is +-1; and
-        # if factor1 is very small, this is the only value we'll ever see.  We need
-        # to make sure that when we convert this back after quantization, it
-        # does not exceed the range of int8.  The worse-case scenario is when
-        # the "delta" value is -1, which gets quantized to a change of +1 in
-        # the integer index of the parameter, which becomes a change of +X
-        # in "delta", where we require X <= 128, because 1+128 = 127 is
-        # the largest positive integer value that we can have.
-        #
-        # This comes down to the
-        # constraint that:
-        #  momentum_quantization_scale / factor1 <= 128.0
-        #  factor1 >= momentum_quantization_scale / 128.0
-        #  factor1 >= 0.07874
-        # lr * range_factor * N >= 0.078125
-        # e.g. if N is 128:
-        #   lr * 0.5 * 128 >= 0.078125
-        #   lr >= 0.0012207
-        # or if N is 16:
-        #   lr >= 0.00976
-
-
-
-
-        quantized = state["quantized"]
-
-
-        new_quantized = new_quantized.clamp_(min=-N, max=N-1).to(torch.int8)
-        delta_quantized = new_quantized - quantized
-        quantized.copy_(new_quantized)
-
-        delta = delta + delta_quantized * ((momentum_quantization_scale * S) * lr)
-
-
-
-
-
-        exp_avg_sq = state["exp_avg_sq"]
-        exp_avg_sq.mul_(beta2).addcmul_(grad, grad, value=(1 - beta2))
-
-        this_step = state["step"]
-        bias_correction2 = 1 - beta2 ** (this_step + 1)
-        if bias_correction2 < 0.99:
-            # note: not in-place.
-            exp_avg_sq = exp_avg_sq * (1.0 / bias_correction2)
-
-        denom = exp_avg_sq.sqrt()
-        denom += eps
-        grad = grad / denom
-
-        alpha = -lr * (1 - beta1) * state["param_rms"].clamp(min=param_min_rms)
-
-        delta = state["delta"]
-        delta.add_(grad * alpha)
-        p.add_(delta)
-
-
+        p.copy_(interp.to(p.dtype))
 
 
     def _get_grad_rms(self, group: dict, grad: Tensor, state: dict):
         """
-        Get inverse root-mean-square value of gradient (comes from a
-        factored estimate of a batch of same-shaped tensors).
+        Get root-mean-square value of gradient (comes from a
+        factored estimate over rows and columns of a matrix; we
+        interpret all tensors as matrices.)  This operates on
+        a batch of same-shaped tensors, so the shape after reshaping
+        is (batch, row, col).
+
             group: dict to look up configs
              grad: a Tensor of type torch.float32, containing grad
             state: the optimization state for this batch.
         """
         shape3d = state["shape3d"]
-        beta1 = group["beta1"]
-        beta2 = group["beta2"]
+        beta1, beta2 = group["betas"]
         eps = group["eps"]
-        momentum_quantization_scale = group["momentum_quantization_scale"]
-        lr = group["lr"]
 
         grad3d_sq = grad.reshape(*shape3d) ** 2
-        (batch_size, rows, cols) = grad3d
+        (batch_size, rows, cols) = shape3d
         grad_sumsq_rows = state["grad_sumsq_rows"]
         grad_sumsq_cols = state["grad_sumsq_cols"]
 
@@ -1649,29 +1629,20 @@ class FFSAdam(BatchedOptimizer):
         if bias_correction2 < 0.99:
             # note: not in-place.
             grad_sumsq_rows = grad_sumsq_rows * (1.0 / bias_correction2)
-            # no need to do it on grad_sumsq_cols, we divide by it also.
+            # no need to do this on grad_sumsq_cols, we divide by it so
+            # it cancels
 
         # gradsq: (batch_size, rows, cols): a moving-average estimate of the
-        # average squared gradient, per element of the tensor
+        # average squared gradient, per element of the tensor.
+        # This is the same way it's done in Adafactor; these two factors
+        # are called R and C there.
         gradsq = (grad_sumsq_rows * (grad_sumsq_cols / grad_sumsq_cols.mean()))
         gradsq = gradsq.reshape(*grad.shape)
 
         return (gradsq + eps).sqrt()
 
 
-
-    @staticmethod
-    def _randomly_quantize(x: Tensor) -> Tensor:
-        """
-        Returns x randomly quantized to int32, like .round(), in a way that
-        preserves expectations, i.e. the expected (quantized value) is the same
-        as x.
-        """
-        return (x + torch.rand_like(x)).round().to(torch.int32)
-
-
-
-    def _step_scalar(self, group: dict, p: Tensor, state: dict):
+    def _step_scalar(self, group: dict, p: Tensor, grad: Tensor, state: dict):
         """
         Just use a (slightly simplified) Adam as the core update for scalar tensors,
         where it does not make sense to separate out a "scale" factor.
@@ -1679,25 +1650,38 @@ class FFSAdam(BatchedOptimizer):
         beta1, beta2 = group["betas"]
         scalar_max = group["scalar_max"]
         eps = group["eps"]
+        # we use a lower learning rate for scalars as well as for the scalar
+        # scaling-factors tensors; this is for stability.
         scalar_lr = group["lr"] * group["scalar_lr_scale"]
-        # exp_avg and exp_avg_sq are torch.float32, so convert to that
-        # type before update.
-        grad = p.grad.to(torch.float32)
+        # exp_avg and exp_avg_sq are torch.float32, so convert grad to that
+        # type before the update.
+        grad = grad.to(torch.float32)
 
         exp_avg_sq = state["exp_avg_sq"]  # shape: (batch_size,)
         exp_avg_sq.mul_(beta2).addcmul_(grad, grad, value=1 - beta2)
 
-        # bias_correction2 is like in Adam.  Don't bother with bias_correction1;
-        # having a slower update at the start will help stability anyway.
+        # bias_correction2 is like in Adam.  We don't bother with
+        # bias_correction1; having a slower update at the start will help
+        # stability anyway.
         bias_correction2 = 1 - beta2 ** (state["step"] + 1)
-        denom = (exp_avg_sq / bias_correction2).sqrt() + eps
+        if bias_correction2 < 0.99:
+            exp_avg_sq = exp_avg_sq / bias_correction2
+            denom = (exp_avg_sq.sqrt() + eps)
 
-        exp_avg = state["exp_avg"]
-        exp_avg.mul_(beta1).add_(grad)
+        delta = state["delta"]  # float32
+        delta.add_(grad / denom, alpha=-scalar_lr)
 
-        p.clamp_(min=-scalar_max, max=scalar_max)
-        p.add_(axp_avg.to(p.dtype), alpha=-scalar_lr)
-
+        # mathematically, the following few lines are equivalent to:
+        #  p += (1 - beta1) * delta
+        #  delta *= beta1
+        # but it ensures that we don't let delta decay unless the momentum
+        # has successfully been transferred to p.  If it doesn't change p
+        # due to small learning rates and roundoff in float16, the change will
+        # accumulate in delta until it is large enough to affect p.
+        delta_p = delta * (1 - beta1)  # e.g. beta1 = 0.9
+        p_new = p + delta_p.to(p.dtype)
+        delta_p -= (p_new - p).to(torch.float32)
+        p.copy_(p_new)
 
 
 class LRScheduler(object):
@@ -2011,10 +1995,8 @@ class Eve(Optimizer):
         return loss
 
 
-def _test_scaled_adam(hidden_dim: int):
+def _test_optimizers(hidden_dim: int):
     import timeit
-
-    from scaling import ScaledLinear
 
     E = 100
     B = 4
@@ -2031,9 +2013,9 @@ def _test_scaled_adam(hidden_dim: int):
     input_magnitudes = (1.0 * torch.randn(E, dtype=dtype, device=device)).exp()
     output_magnitudes = (1.0 * torch.randn(E, dtype=dtype, device=device)).exp()
 
-    for iter in [1, 0]:
+    for iter in [2, 0, 1]:
         fix_random_seed(42)
-        Linear = torch.nn.Linear if iter == 0 else ScaledLinear
+        Linear = torch.nn.Linear
 
         m = torch.nn.Sequential(
             Linear(E, hidden_dim),
@@ -2057,6 +2039,9 @@ def _test_scaled_adam(hidden_dim: int):
             optim = Eve(m.parameters(), lr=0.003)
         elif iter == 1:
             optim = ScaledAdam(m.parameters(), lr=0.03, clipping_scale=2.0)
+        elif iter == 2:
+            optim = FSAdafactor(m.parameters(), lr=0.03, clipping_scale=2.0)
+
         scheduler = Eden(optim, lr_batches=200, lr_epochs=5, verbose=False)
 
         start = timeit.default_timer()
@@ -2126,5 +2111,5 @@ if __name__ == "__main__":
     else:
         hidden_dim = 200
 
-    _test_scaled_adam(hidden_dim)
+    _test_optimizers(hidden_dim)
     _test_eden()
