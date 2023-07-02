@@ -1062,7 +1062,7 @@ class FSAdafactor(BatchedOptimizer):
            state: Dict from string to whatever state we are initializing
         """
 
-        state.setdefault("step",  0)
+        state.setdefault("step",  1)
 
         kwargs = {"device": p.device, "dtype": p.dtype}
 
@@ -1071,7 +1071,7 @@ class FSAdafactor(BatchedOptimizer):
         numel = p.numel() // batch_size
 
         if numel > 1:
-            p_3d = _reshape_as_3d(p)
+            p_3d = FSAdafactor._reshape_as_3d(p)
             shape3d = list(p_3d.shape)
             state.setdefault("shape3d", shape3d)
 
@@ -1087,13 +1087,14 @@ class FSAdafactor(BatchedOptimizer):
             # zero or extremely close to zero.  We'll apply the same limit when we update this
             # during training.
             state["quantized_rms"] = (
-                (quantized ** 2).mean(dim=list(range(1, p.ndim)), keepdim=True).to(torch.float32).sqrt()
+                (quantized.to(torch.float32) ** 2).mean(dim=list(range(1, p.ndim)), keepdim=True).sqrt()
             ).clamp_(min=2**11)
+            print(f"qrms0={state['quantized_rms']}")
 
             # moving-average square of the derivative w.r.t. the log of the
             # scaling factor `scale`, one per parameter tensor.
             state.setdefault("scale_exp_avg_sq",
-                             torch.zeros(*S.shape, dtype=torch.float32, device=S.device))
+                             torch.zeros(*scale.shape, dtype=torch.float32, device=scale.device))
 
             # the following is going to be used for a factored representation of
             # the exp_avg_sq of Adam: we store sums by row and column, to save
@@ -1139,7 +1140,7 @@ class FSAdafactor(BatchedOptimizer):
         """
         # remove the batch-of-parameter-tensors dim.
         param_shape = list(p.shape[1:])
-        while param_shape.len < 2:
+        while len(param_shape) < 2:
             param_shape.append(1)
         best_metric = float('inf')
         best_pos = -1
@@ -1187,7 +1188,10 @@ class FSAdafactor(BatchedOptimizer):
         max_scale = group["max_quantization_scale"]
 
         N = 2 ** 15
-        p_max = p.abs().max(dim=list(range(1, len(p.shape))), keepdim=True)
+        p_max = p.abs()
+        for d in range(1, len(p.shape)):
+            p_max = p_max.max(dim=d, keepdim=True)[0]
+
         scale = p_max.clamp(min=min_scale, max=max_scale)
         S = scale / N
         quantized = (p.to(torch.float32) / S).round().clamp(min=-N, max=N-1).to(torch.int16)
@@ -1230,9 +1234,9 @@ class FSAdafactor(BatchedOptimizer):
                     "FSAdafactor optimizer does not support sparse gradients"
                 )
             if p.numel() == p.shape[0]:  # a batch of scalars
-                tot_sumsq += (grad**2).sum()  # sum() to change shape [1] to []
+                tot_sumsq += (grad**2).sum()
             else:
-                tot_sumsq += ((grad * state["param_rms"]) ** 2).sum()
+                tot_sumsq += ((grad * state["quantized_rms"] * (state["scale"] * (2. ** -15))) ** 2).sum()
 
         tot_norm = tot_sumsq.sqrt()
         if "model_norms" not in first_state:
@@ -1384,70 +1388,6 @@ class FSAdafactor(BatchedOptimizer):
 
         state["step"] = step + 1
 
-    def _size_update(
-            self, group: dict, scale_grads: Tensor, p: Tensor, state: dict
-    ) -> None:
-        """
-               Called only where p.numel() > 1, this updates the scale of the parameter.
-               If we imagine: p =  underlying_param * scale.exp(), and we are doing
-               gradient descent on underlying param and on scale, this function does the update
-               on `scale`.
-
-               Args:
-              group: dict to look up configuration values
-        scale_grads: a tensor of shape (size_update_period, batch_size, 1, 1,...) containing
-                      grads w.r.t. the scales.
-                  p:  The parameter to update
-               state: The state-dict of p
-        """
-
-        param_rms = state["param_rms"]
-        beta1, beta2 = group["betas"]
-        size_lr = group["lr"] * group["scalar_lr_scale"]
-        min_scale = group["min_quantization_scale"]
-        max_scale = group["max_quantization_scale"]
-        eps = group["eps"]
-        step = state["step"]
-        batch_size = p.shape[0]
-
-        size_update_period = scale_grads.shape[0]
-        # correct beta2 for the size update period: we will have
-        # faster decay at this level.
-        beta2_corr = beta2**size_update_period
-
-        scale_exp_avg_sq = state["scale_exp_avg_sq"]  # shape: (batch_size, 1, 1, ..)
-        scale_exp_avg_sq.mul_(beta2_corr).add_(
-            (scale_grads**2).mean(dim=0),  # mean over dim `size_update_period`
-            alpha=1 - beta2_corr,
-        )  # shape is (batch_size, 1, 1, ...)
-
-        # The 1st time we reach here is when size_step == 1.
-        size_step = (step + 1) // size_update_period
-        bias_correction2 = 1 - beta2_corr**size_step
-        # we don't bother with bias_correction1; this will help prevent divergence
-        # at the start of training.
-
-        denom = scale_exp_avg_sq.sqrt() + eps
-
-        scale_step = (
-            -size_lr * (bias_correction2**0.5) * scale_grads.sum(dim=0) / denom
-        )
-
-        is_too_small = param_rms < param_min_rms
-
-        # when the param gets too small, just don't shrink it any further.
-        scale_step.masked_fill_(is_too_small, 0.0)
-
-        # and ensure the parameter rms after update never exceeds param_max_rms.
-        # We have to look at the trained model for parameters at or around the
-        # param_max_rms, because sometimes they can indicate a problem with the
-        # topology or settings.
-        scale_step = torch.minimum(scale_step,
-                                   (param_max_rms - param_rms) / param_rms)
-
-        delta = state["delta"]
-        # the factor of (1-beta1) relates to momentum.
-        delta.add_(p * scale_step, alpha=(1 - beta1))
 
     def _step(self, group: dict, p: Tensor, grad: Tensor, state: dict):
         """
@@ -1462,7 +1402,7 @@ class FSAdafactor(BatchedOptimizer):
         This function modifies p.
         """
         lr = group["lr"]
-        scalar_lr_sale = group["scalar_lr_scale"]
+        scalar_lr_scale = group["scalar_lr_scale"]
         beta1, beta2 = group["betas"]
         eps = group["eps"]
 
@@ -1475,7 +1415,8 @@ class FSAdafactor(BatchedOptimizer):
             # This updates the scale.
             # scale_grad is gradient w.r.t. log of scaling factor "tick".
             grad_times_param = (grad * p32)
-            scale_grad = grad_times_param.sum(dim=list(range(1, grad.ndim)), keepdim=True)
+            scale_grad = grad_times_param.sum(dim=list(range(1, grad.ndim)),
+                                              keepdim=True)
 
             scale_exp_avg_sq = state["scale_exp_avg_sq"]
             scale_exp_avg_sq.mul_(beta2).add_(
@@ -1487,15 +1428,19 @@ class FSAdafactor(BatchedOptimizer):
                 scale_exp_avg_sq = scale_exp_avg_sq / bias_correction2
 
             # update the "scale" size parameter
-            scale_norm_grad = scale_grad * ((scale_exp_avg_sq + eps) **  -0.5)
+            scale_norm_grad = scale_grad / (scale_exp_avg_sq + eps).sqrt()
+
+            if random.random() < 0.02:
+                print(f"scale_norm_grad rms={(scale_norm_grad**2).mean().sqrt()}")
             scale = state["scale"]
+            scale0 = scale.clone()
             scale.add_(
                 (scale_norm_grad * scale),
                 alpha=-lr*scalar_lr_scale,
             )
             scale.clamp_(min=group["min_quantization_scale"],
                          max=group["max_quantization_scale"])
-
+            #print(f"Scale: {scale0}->{scale}")
 
         quantized = state["quantized"]  # of int16 type
 
@@ -1512,13 +1457,15 @@ class FSAdafactor(BatchedOptimizer):
             # or extremely close to zero.  We'll apply the same limit when we
             # update this during training.
             state["quantized_rms"] = (
-                (quantized ** 2).mean(dim=list(range(1, p.ndim)), keepdim=True).to(torch.float32).sqrt()
+                (quantized.to(torch.float32) ** 2).mean(dim=list(range(1, p.ndim)), keepdim=True).sqrt()
             ).clamp_(min=2**11)
-
+            if random.random() < 0.01:
+                print(f"qrms={state['quantized_rms']}")
 
         grad_rms = self._get_grad_rms(group, grad, state)
         # grad_norm should usually have root-mean-square value around 1.
         grad_norm = grad / grad_rms
+
 
         # normally lr_scale will be quite a bit more than 1, since quantized_rms
         # will normally be about 2**14 ~ 4000, and lr will normally be in the
@@ -1609,7 +1556,7 @@ class FSAdafactor(BatchedOptimizer):
         is (batch, row, col).
 
             group: dict to look up configs
-             grad: a Tensor of type torch.float32, containing grad
+             grad: a Tensor of type torch.float32, containing gradient
             state: the optimization state for this batch.
         """
         shape3d = state["shape3d"]
@@ -1620,17 +1567,21 @@ class FSAdafactor(BatchedOptimizer):
         (batch_size, rows, cols) = shape3d
         grad_sumsq_rows = state["grad_sumsq_rows"]
         grad_sumsq_cols = state["grad_sumsq_cols"]
+        step = state["step"]
+        #print(f"grad3d_sq mean={grad3d_sq.mean()}, step={step}")
 
-        grad_sumsq_rows.mul_(beta2).add(grad3d_sq.sum(dim=2),
-                                        alpha=1-beta2)
-        grad_sumsq_cols.mul_(beta2).add(grad3d_sq.sum(dim=1),
-                                        alpha=1-beta2)
+        grad_sumsq_rows.mul_(beta2).add_(grad3d_sq.mean(dim=2, keepdim=True),
+                                         alpha=(1-beta2))
+        grad_sumsq_cols.mul_(beta2).add_(grad3d_sq.mean(dim=1, keepdim=True),
+                                         alpha=(1-beta2))
+        grad_sumsq_cols.add_(eps)  # prevent division by zero
 
+        bias_correction2 = 1 - beta2**step
         if bias_correction2 < 0.99:
             # note: not in-place.
             grad_sumsq_rows = grad_sumsq_rows * (1.0 / bias_correction2)
             # no need to do this on grad_sumsq_cols, we divide by it so
-            # it cancels
+            # any scalar factor cancels
 
         # gradsq: (batch_size, rows, cols): a moving-average estimate of the
         # average squared gradient, per element of the tensor.
@@ -1666,7 +1617,7 @@ class FSAdafactor(BatchedOptimizer):
         bias_correction2 = 1 - beta2 ** (state["step"] + 1)
         if bias_correction2 < 0.99:
             exp_avg_sq = exp_avg_sq / bias_correction2
-            denom = (exp_avg_sq.sqrt() + eps)
+        denom = (exp_avg_sq.sqrt() + eps)
 
         delta = state["delta"]  # float32
         delta.add_(grad / denom, alpha=-scalar_lr)
