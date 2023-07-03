@@ -1967,8 +1967,8 @@ def _test_optimizers(hidden_dim: int):
     B = 4
     T = 2
     logging.info("in test_eve_cain")
-    # device = torch.device('cuda')
-    device = torch.device("cpu")
+    device = torch.device('cuda')
+    # device = torch.device("cpu")
     dtype = torch.float32
 
     fix_random_seed(42)
@@ -1978,7 +1978,7 @@ def _test_optimizers(hidden_dim: int):
     input_magnitudes = (1.0 * torch.randn(E, dtype=dtype, device=device)).exp()
     output_magnitudes = (1.0 * torch.randn(E, dtype=dtype, device=device)).exp()
 
-    for expt in [ 'FSAdafactor4', 'FSAdafactor8', 'ScaledAdam', 'Eve' ]:
+    for expt in [ 'FSAdafactor8_float16', 'FSAdafactor8', 'FSAdafactor4', 'ScaledAdam', 'Eve' ]:
         fix_random_seed(42)
         Linear = torch.nn.Linear
 
@@ -2004,12 +2004,18 @@ def _test_optimizers(hidden_dim: int):
             optim = Eve(m.parameters(), lr=0.003)
         elif expt == 'ScaledAdam':
             optim = ScaledAdam(m.parameters(), lr=0.03, clipping_scale=2.0)
-        elif expt == 'FSAdafactor8':
+        elif expt in [ 'FSAdafactor8', 'FSAdafactor8_float16' ]:
             optim = FSAdafactor(m.parameters(), lr=0.03, clipping_scale=2.0)
         else:
             assert expt == 'FSAdafactor4'
             optim = FSAdafactor(m.parameters(), lr=0.03, clipping_scale=2.0,
                                 param_bits=4)
+
+
+        if 'float16' in expt:
+            m = m.to(torch.float16)
+            train_pairs = [ (x[0].to(torch.float16), x[1].to(torch.float16))
+                             for x in train_pairs ]
 
         scheduler = Eden(optim, lr_batches=200, lr_epochs=5, verbose=False)
 
