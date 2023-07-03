@@ -1089,7 +1089,6 @@ class FSAdafactor(BatchedOptimizer):
             state["quantized_rms"] = (
                 (quantized.to(torch.float32) ** 2).mean(dim=list(range(1, p.ndim)), keepdim=True).sqrt()
             ).clamp_(min=2**11)
-            print(f"qrms0={state['quantized_rms']}")
 
             # moving-average square of the derivative w.r.t. the log of the
             # scaling factor `scale`, one per parameter tensor.
@@ -1430,8 +1429,8 @@ class FSAdafactor(BatchedOptimizer):
             # update the "scale" size parameter
             scale_norm_grad = scale_grad / (scale_exp_avg_sq + eps).sqrt()
 
-            if random.random() < 0.001:
-                print(f"scale_norm_grad rms={(scale_norm_grad**2).mean().sqrt()}")
+            #if random.random() < 0.001:
+            #    print(f"scale_norm_grad rms={(scale_norm_grad**2).mean().sqrt()}")
             scale = state["scale"]
             scale0 = scale.clone()
             scale.add_(
@@ -1459,8 +1458,6 @@ class FSAdafactor(BatchedOptimizer):
             state["quantized_rms"] = (
                 (quantized.to(torch.float32) ** 2).mean(dim=list(range(1, p.ndim)), keepdim=True).sqrt()
             ).clamp_(min=2**11)
-            if random.random() < 0.01:
-                print(f"qrms={state['quantized_rms']}")
 
 
         if True:
@@ -2011,7 +2008,7 @@ def _test_optimizers(hidden_dim: int):
             optim = FSAdafactor(m.parameters(), lr=0.03, clipping_scale=2.0)
         else:
             assert expt == 'FSAdafactor4'
-            optim = FSAdafactor(m.parameters(), lr=0.04, clipping_scale=2.0,
+            optim = FSAdafactor(m.parameters(), lr=0.03, clipping_scale=2.0,
                                 param_bits=4)
 
         scheduler = Eden(optim, lr_batches=200, lr_epochs=5, verbose=False)
