@@ -1487,7 +1487,7 @@ class FSAdafactor(BatchedOptimizer):
             # but as a kind of compromise we do add random noise if the lr is smaller
             # than 0.001: see the if-statement below.
             if lr < 0.001:
-                quantized_delta += torch.empty(*p.size, dtype=torch.float32,
+                quantized_delta += torch.empty(*p.shape, dtype=torch.float32,
                                                device=p.device).uniform_(-0.5, 0.5)
                 # adding the random noise is kind of pointless if the learning rates
                 # are higher than this.  Actually lr < 0.001 is too small and shouldn't
@@ -1524,10 +1524,9 @@ quantized_float: this is a temporary value passed into avoid recomputing it;
         scale_coarse = (state["scale"] * (1.0 / Np))
 
         # interp_coarse has a value between -Np and Np, but it is not
-        # quantized yet.  It will consist of the interpolated value between "p"
+        # quantized yet.  It will represent an interpolated value between "p"
         # and our "internal representation of p", with a momentum-like equation:
         #        "p = beta1 p + (1-beta1) [our internal representation of p],
-
         # ... but this is all scaled by 1.0 / scale_coarse, so the range is
         # between about -Np and Np.  We treat this as an expectation.  The idea is
         # that we pick the discretized value so that it has a certain
@@ -1541,7 +1540,6 @@ quantized_float: this is a temporary value passed into avoid recomputing it;
         )
         interp_coarse.mul_(1 - beta1).add_(p.to(torch.float32) / scale_coarse,
                                            alpha=beta1)
-
 
         coarse_ceil = torch.ceil(interp_coarse)
         coarse_floor = coarse_ceil - 1
@@ -1562,7 +1560,7 @@ quantized_float: this is a temporary value passed into avoid recomputing it;
         # we'd have to have a more sophisticated update strategy in bfloat16,
         # it has only 7 (+ 1 implicit) mantissa bits which is not enough
         # to avoid bad roundoff problems (the p.copy_ line above would lose
-        # too much precision, making the expectations very inaccurate).
+        # too much precision, making the expectations too inaccurate).
         assert p.dtype != torch.bfloat16
 
 
@@ -1983,7 +1981,7 @@ def _test_optimizers(hidden_dim: int):
     input_magnitudes = (1.0 * torch.randn(E, dtype=dtype, device=device)).exp()
     output_magnitudes = (1.0 * torch.randn(E, dtype=dtype, device=device)).exp()
 
-    for iter in [2, 0, 1]:
+    for expt in [ 'FSAdafactor4', 'FSAdafactor8', 'ScaledAdam', 'Eve' ]:
         fix_random_seed(42)
         Linear = torch.nn.Linear
 
@@ -2005,12 +2003,16 @@ def _test_optimizers(hidden_dim: int):
             for _ in range(20)
         ]
 
-        if iter == 0:
+        if expt == 'Eve':
             optim = Eve(m.parameters(), lr=0.003)
-        elif iter == 1:
+        elif expt == 'ScaledAdam':
             optim = ScaledAdam(m.parameters(), lr=0.03, clipping_scale=2.0)
-        elif iter == 2:
+        elif expt == 'FSAdafactor8':
             optim = FSAdafactor(m.parameters(), lr=0.03, clipping_scale=2.0)
+        else:
+            assert expt == 'FSAdafactor4'
+            optim = FSAdafactor(m.parameters(), lr=0.04, clipping_scale=2.0,
+                                param_bits=4)
 
         scheduler = Eden(optim, lr_batches=200, lr_epochs=5, verbose=False)
 
@@ -2045,7 +2047,7 @@ def _test_optimizers(hidden_dim: int):
                     # scale2b = '%.2e' % (m[2].bias_scale.exp().item())
                     lr = scheduler.get_last_lr()[0]
                     logging.info(
-                        f"Iter {iter}, epoch {epoch}, batch {n}, avg_loss {avg_loss:.4g}, lr={lr:.4e}"
+                        f"Version {expt}, epoch {epoch}, batch {n}, avg_loss {avg_loss:.4g}, lr={lr:.4e}"
                     )  # , norms={norm1,norm1b,norm2,norm2b}") # scales={scale1,scale1b,scale2,scale2b}
                 loss.log().backward()
                 optim.step()
@@ -2055,7 +2057,7 @@ def _test_optimizers(hidden_dim: int):
         # diagnostic.print_diagnostics()
 
         stop = timeit.default_timer()
-        logging.info(f"Iter={iter}, Time taken: {stop - start}")
+        logging.info(f"Version={expt}, Time taken: {stop - start}")
 
         logging.info(f"last lr = {scheduler.get_last_lr()}")
         # logging.info("state dict = ", scheduler.state_dict())
