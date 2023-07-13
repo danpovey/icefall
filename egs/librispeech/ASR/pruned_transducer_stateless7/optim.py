@@ -1077,8 +1077,11 @@ class FSAdafactor(BatchedOptimizer):
 
             quantized, scale = FSAdafactor._quantize_params(group, p)
 
-            state["quantized"] = quantized # quantized: same shape as p.
-            state["scale"] = scale  # tick size for the quantization, shape: (batch_size, 1, 1, ...)
+            state["quantized"] = quantized # quantized: same shape as p, type int16
+            state["scale"] = scale  # dtype=torch.float32, shape: (batch_size, 1, 1, ...)
+            # scale is the scale factor for the quantization, representing the
+            # largest (negative) value that 'quantized' can code for.
+
 
             # RMS of "quantized" (in its quantized representation, so this number may be close to 2**15).
             # This is used as a factor within the learning rate, as in ScaledAdam..
@@ -1159,7 +1162,6 @@ class FSAdafactor(BatchedOptimizer):
                         prod(param_shape[:best_pos]),
                         prod(param_shape[best_pos:]))
         assert ans.data_ptr() == p.data_ptr(), "Need to change this code to deal with non-contiguous model params"
-
         return ans
 
 
@@ -1179,7 +1181,8 @@ class FSAdafactor(BatchedOptimizer):
 
         Returns: (quantized, scale), where:
            quantized: a tensor of torch.int16, with the same shape as p
-               scale: a positive scale, of shape (batch_size, 1, 1, ... ), such that
+               scale: a positive scale, of shape (batch_size, 1, 1, ... ), and type
+                      torch.float32, such that
                       (quantized * scale / (2**15)) is an approximation to p.
         """
         param_bits = group["param_bits"]
@@ -1191,7 +1194,7 @@ class FSAdafactor(BatchedOptimizer):
         for d in range(1, len(p.shape)):
             p_max = p_max.max(dim=d, keepdim=True)[0]
 
-        scale = p_max.clamp(min=min_scale, max=max_scale)
+        scale = p_max.to(torch.float32).clamp(min=min_scale, max=max_scale)
         S = scale / N
         quantized = (p.to(torch.float32) / S).round().clamp(min=-N, max=N-1).to(torch.int16)
 
@@ -1432,14 +1435,12 @@ class FSAdafactor(BatchedOptimizer):
             #if random.random() < 0.001:
             #    print(f"scale_norm_grad rms={(scale_norm_grad**2).mean().sqrt()}")
             scale = state["scale"]
-            scale0 = scale.clone()
             scale.add_(
                 (scale_norm_grad * scale),
                 alpha=-lr*scalar_lr_scale,
             )
             scale.clamp_(min=group["min_quantization_scale"],
                          max=group["max_quantization_scale"])
-            #print(f"Scale: {scale0}->{scale}")
 
         quantized = state["quantized"]  # of int16 type
 
@@ -1470,9 +1471,6 @@ class FSAdafactor(BatchedOptimizer):
 
             quantized_float = quantized.to(torch.float)
 
-            # adding -0.5 + torch.rand(..), and later doing round(), is a way to
-            # quantize that preserves expectations, so rounding should not cause
-            # any systematic error, i.e. should not prevent convergence.
             quantized_delta = (grad_norm * lr_scale)
 
             # normally lr_scale will be quite a bit more than 1, since quantized_rms
@@ -1645,7 +1643,7 @@ quantized_float: this is a temporary value passed into avoid recomputing it;
         # accumulate in delta until it is large enough to affect p.
         delta_p = delta * (1 - beta1)  # e.g. beta1 = 0.9
         p_new = p + delta_p.to(p.dtype)
-        delta_p -= (p_new - p).to(torch.float32)
+        delta -= (p_new - p).to(torch.float32)
         p.copy_(p_new)
 
 
@@ -1961,12 +1959,19 @@ class Eve(Optimizer):
 
 
 def _test_optimizers(hidden_dim: int):
+    class ScalarScale(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.alpha = torch.nn.Parameter(torch.ones(()))
+        def forward(self, x):
+            return x * self.alpha
+
+
     import timeit
 
     E = 100
     B = 4
     T = 2
-    logging.info("in test_eve_cain")
     device = torch.device('cuda')
     # device = torch.device("cpu")
     dtype = torch.float32
@@ -1984,6 +1989,7 @@ def _test_optimizers(hidden_dim: int):
 
         m = torch.nn.Sequential(
             Linear(E, hidden_dim),
+            ScalarScale(),
             torch.nn.PReLU(),
             Linear(hidden_dim, hidden_dim),
             torch.nn.PReLU(),
@@ -2034,7 +2040,8 @@ def _test_optimizers(hidden_dim: int):
 
             for n, (x, y) in enumerate(train_pairs):
                 y_out = m(x)
-                loss = ((y_out - y) ** 2).mean() * 100.0
+                assert torch.all((y_out - y_out) == 0) # check no inf/nan
+                loss = ((y_out - y).clamp(min=-100, max=100) ** 2).to(torch.float32).mean() * 100.0
                 if epoch == 0 and n == 0:
                     avg_loss = loss.item()
                 else:
