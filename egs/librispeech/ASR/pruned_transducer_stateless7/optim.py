@@ -1112,6 +1112,14 @@ class FSAdafactor(BatchedOptimizer):
                              torch.zeros(batch_size, 1, cols,
                                          dtype=torch.float32,
                                          device=p.device))
+
+            ## for testing:
+            #state.setdefault("grad_sumsq",
+            #                 torch.zeros(*p.shape,
+            #                             dtype=torch.float32,
+            #                             device=p.device))
+
+
         else:
             # For scalar parameters, we just do something similar to normal
             # Adam, refactored to be kind to roundoff effects incurred if the
@@ -1422,7 +1430,7 @@ class FSAdafactor(BatchedOptimizer):
 
             scale_exp_avg_sq = state["scale_exp_avg_sq"]
             scale_exp_avg_sq.mul_(beta2).add_(
-                (scale_grad**2),
+                (scale_grad ** 2),
                 alpha=1 - beta2,
             )  # shape is (batch_size, 1, 1, ...)
             bias_correction2 = 1 - beta2**step
@@ -1430,7 +1438,7 @@ class FSAdafactor(BatchedOptimizer):
                 scale_exp_avg_sq = scale_exp_avg_sq / bias_correction2
 
             # update the "scale" size parameter
-            scale_norm_grad = scale_grad / (scale_exp_avg_sq + eps).sqrt()
+            scale_norm_grad = scale_grad / (scale_exp_avg_sq.sqrt() + eps)
 
             #if random.random() < 0.001:
             #    print(f"scale_norm_grad rms={(scale_norm_grad**2).mean().sqrt()}")
@@ -1449,17 +1457,17 @@ class FSAdafactor(BatchedOptimizer):
             # 2 ** 15, e.g. it might be 2 ** 13 or 14, perhaps decreasing as we train.
             #
             # quantized_rms is used as a factor within the learning rate, as in
-            # "param_rms" in ScaledAdam.  We put a minimum limit of 2**11 on
+            # "param_rms" in ScaledAdam.  We put a minimum limit of 2**10 on
             # this: so 8 times less than the maximum possible value, to ensure
             # that when the parameters start off near zero we quickly grow the
             # quantized parameters to a reasonable size.  This should only
             # really be reached in cases where the parameters start off as zero
             # or extremely close to zero.  We'll apply the same limit when we
             # update this during training.
-            state["quantized_rms"] = (
-                (quantized.to(torch.float32) ** 2).mean(dim=list(range(1, p.ndim)), keepdim=True).sqrt()
-            ).clamp_(min=2**11)
-
+            q = (quantized.to(torch.float32) ** 2).mean(dim=list(range(1, p.ndim)),
+                                                        keepdim=True)
+            q = q.sqrt().clamp_(min=2**11)
+            state["quantized_rms"].copy_(q)
 
         if True:
             # This block updates "quantized"
@@ -1467,11 +1475,22 @@ class FSAdafactor(BatchedOptimizer):
             # grad_norm should usually have root-mean-square value around 1.
             grad_norm = grad / grad_rms
 
+            # the factor "quantized_rms" is analogous to the "param_rms" in ScaledAdam,
+            # the goal is to have the update speed proportional to the rms value of
+            # the tensor
             lr_scale = (-lr * state["quantized_rms"])
 
             quantized_float = quantized.to(torch.float)
 
-            quantized_delta = (grad_norm * lr_scale)
+            # the 2nd term is a "shrinkage" term to counteract the statistical-noise
+            # effect that increases the norm of "quantized" each time.  this would
+            # normally not be necessary as the scale update takes care of it; the
+            # problem is that we have a limitation on the range of "quantized", and
+            # unless we do this we get too many parameters "stuck at the ends".
+            # the idea is that if grad_norm is i.i.d. noise, the variances of the
+            # left and right terms below are the same, and we don't grow the parameter
+            # size on average.
+            quantized_delta = (grad_norm * lr_scale) - (quantized_float * lr ** 2)
 
             # normally lr_scale will be quite a bit more than 1, since quantized_rms
             # will normally be about 2**14 ~ 4000, and lr will normally be in the
@@ -1490,6 +1509,11 @@ class FSAdafactor(BatchedOptimizer):
 
             quantized_float = (quantized.to(torch.float32) + quantized_delta.round()).clamp_(
                 min=-32768, max=32767)
+
+            if random.random() < 0.001:
+                proportion_at_ends = (quantized_float.abs() >= 32500).to(torch.float32).mean()
+                logging.info(f"proportion_at_ends={proportion_at_ends}")
+
             quantized.copy_(
                 quantized_float.to(torch.int16)
             )
@@ -1603,6 +1627,13 @@ quantized_float: this is a temporary value passed into avoid recomputing it;
 
         return gradsq.sqrt() + eps
 
+        #    grad_sumsq = state["grad_sumsq"]
+        #    grad_sumsq.mul_(beta2).add_(grad ** 2,
+        #                                alpha=(1-beta2))
+        #    if bias_correction2 < 0.99:
+        #        # note: not in-place.
+        #        grad_sumsq = grad_sumsq * (1.0 / bias_correction2)
+        #    return grad_sumsq.sqrt() + eps
 
     def _step_scalar(self, group: dict, p: Tensor, grad: Tensor, state: dict):
         """
@@ -1641,7 +1672,7 @@ quantized_float: this is a temporary value passed into avoid recomputing it;
         # due to small learning rates and roundoff in float16, the change will
         # accumulate in delta until it is large enough to affect p.
         delta_p = delta * (1 - beta1)  # e.g. beta1 = 0.9
-        p_new = p + delta_p.to(p.dtype)
+        p_new = (p + delta_p.to(p.dtype)).clamp_(min=-scalar_max, max=scalar_max)
         delta -= (p_new - p).to(torch.float32)
         p.copy_(p_new)
 
@@ -1950,9 +1981,6 @@ class Eve(Optimizer):
 
                 if random.random() < 0.0005:
                     step = (exp_avg / denom) * step_size
-                    logging.info(
-                        f"Delta rms = {(step**2).mean().item()}, shape = {step.shape}"
-                    )
 
         return loss
 
