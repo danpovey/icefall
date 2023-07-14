@@ -1514,7 +1514,7 @@ class FSAdafactor(BatchedOptimizer):
                 min=-32768, max=32767)
 
             if random.random() < 0.0001:
-                proportion_at_ends = (quantized_float.abs() >= 32500).to(torch.float32).mean()
+                proportion_at_ends = (quantized_float.abs() >= 32768*q_scale).to(torch.float32).mean()
                 logging.info(f"proportion_at_ends={proportion_at_ends}")
 
             quantized.copy_(
