@@ -1597,7 +1597,8 @@ quantized_float: this is a temporary value passed into avoid recomputing it;
         # average squared gradient, per element of the tensor.
         # This is the same way it's done in Adafactor; these two factors
         # are called R and C there.
-        gradsq = (grad_sumsq_rows * (grad_sumsq_cols / (grad_sumsq_cols.mean(dim=(1, 2)) + (eps*eps))))
+        cols_mean = grad_sumsq_cols.mean(dim=2, keepdim=True) + (eps*eps)
+        gradsq = (grad_sumsq_rows * (grad_sumsq_cols / cols_mean))
         gradsq = gradsq.reshape(*grad.shape)
 
         return gradsq.sqrt() + eps
