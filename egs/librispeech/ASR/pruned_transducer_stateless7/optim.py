@@ -857,6 +857,7 @@ class FSAdafactor(BatchedOptimizer):
             eps=eps,
             min_quantization_scale=min_quantization_scale,
             max_quantization_scale=max_quantization_scale,
+            q_scale=0.9,  # not user configurable; should be <1.0
             scalar_max=scalar_max,
             clipping_update_period=clipping_update_period,
         )
@@ -1196,13 +1197,14 @@ class FSAdafactor(BatchedOptimizer):
         param_bits = group["param_bits"]
         min_scale = group["min_quantization_scale"]
         max_scale = group["max_quantization_scale"]
+        q_scale = group["q_scale"]
 
         N = 2 ** 15
         p_max = p.abs()
         for d in range(1, len(p.shape)):
             p_max = p_max.max(dim=d, keepdim=True)[0]
 
-        scale = p_max.to(torch.float32).clamp(min=min_scale, max=max_scale)
+        scale = (p_max.to(torch.float32) / q_scale).clamp(min=min_scale, max=max_scale)
         S = scale / N
         quantized = (p.to(torch.float32) / S).round().clamp(min=-N, max=N-1).to(torch.int16)
 
@@ -1415,7 +1417,7 @@ class FSAdafactor(BatchedOptimizer):
         scalar_lr_scale = group["scalar_lr_scale"]
         beta1, beta2 = group["betas"]
         eps = group["eps"]
-
+        q_scale = group["q_scale"]
         step = state["step"]
 
         grad = p.grad.to(torch.float32)
@@ -1425,8 +1427,11 @@ class FSAdafactor(BatchedOptimizer):
             # This updates the scale.
             # scale_grad is gradient w.r.t. log of scaling factor "tick".
             grad_times_param = (grad * p32)
+            grad_times_param_not_extremal = (grad * (state["quantized"].abs() < q_scale * 32768)) * p32
             scale_grad = grad_times_param.sum(dim=list(range(1, grad.ndim)),
                                               keepdim=True)
+            scale_grad_not_extremal = grad_times_param_not_extremal.sum(dim=list(range(1, grad.ndim)),
+                                                                        keepdim=True)
 
             scale_exp_avg_sq = state["scale_exp_avg_sq"]
             scale_exp_avg_sq.mul_(beta2).add_(
@@ -1438,7 +1443,9 @@ class FSAdafactor(BatchedOptimizer):
                 scale_exp_avg_sq = scale_exp_avg_sq / bias_correction2
 
             # update the "scale" size parameter
-            scale_norm_grad = scale_grad / (scale_exp_avg_sq.sqrt() + eps)
+            denom = (scale_exp_avg_sq.sqrt() + eps)
+            scale_norm_grad = scale_grad / denom
+            scale_norm_grad_not_extremal = scale_grad_not_extremal / denom
 
             #if random.random() < 0.001:
             #    print(f"scale_norm_grad rms={(scale_norm_grad**2).mean().sqrt()}")
@@ -1482,15 +1489,11 @@ class FSAdafactor(BatchedOptimizer):
 
             quantized_float = quantized.to(torch.float)
 
-            # the 2nd term is a "shrinkage" term to counteract the statistical-noise
-            # effect that increases the norm of "quantized" each time.  this would
-            # normally not be necessary as the scale update takes care of it; the
-            # problem is that we have a limitation on the range of "quantized", and
-            # unless we do this we get too many parameters "stuck at the ends".
-            # the idea is that if grad_norm is i.i.d. noise, the variances of the
-            # left and right terms below are the same, and we don't grow the parameter
-            # size on average.
-            quantized_delta = (grad_norm * lr_scale) - (quantized_float * lr ** 2)
+            # the 2nd term is applying something like the scale update to the "quantized"
+            # parameters directly, but estimating it using a gradient that only
+            # includes non-"extremal" parameters, i.e. ones that wouldn't be clipped
+            # to the allowed range of 0.9 of the full quantized range.
+            quantized_delta = (grad_norm * lr_scale) + (quantized_float * -lr * scalar_lr_scale * scale_norm_grad_not_extremal)
 
             # normally lr_scale will be quite a bit more than 1, since quantized_rms
             # will normally be about 2**14 ~ 4000, and lr will normally be in the
@@ -1538,11 +1541,13 @@ quantized_float: this is a temporary value passed into avoid recomputing it;
         """
         param_bits = group["param_bits"]
         beta1 = group["betas"][0]
+        q_scale = group["q_scale"]
         Np = 2 ** (param_bits - 1)
 
-        scale_coarse = (state["scale"] * (1.0 / Np))
+        scale_coarse = (state["scale"] / (Np * q_scale))
 
-        # interp_coarse has a value between -Np and Np, but it is not
+        # interp_coarse has a value between -Np and Np, or a little over the ends
+        # for extremal values, but it is not
         # quantized yet.  It will represent an interpolated value between "p"
         # and our "internal representation of p", with a momentum-like equation:
         #        "p = beta1 p + (1-beta1) [our internal representation of p],
