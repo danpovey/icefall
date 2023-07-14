@@ -1580,13 +1580,11 @@ quantized_float: this is a temporary value passed into avoid recomputing it;
         grad_sumsq_rows = state["grad_sumsq_rows"]
         grad_sumsq_cols = state["grad_sumsq_cols"]
         step = state["step"]
-        #print(f"grad3d_sq mean={grad3d_sq.mean()}, step={step}")
 
         grad_sumsq_rows.mul_(beta2).add_(grad3d_sq.mean(dim=2, keepdim=True),
                                          alpha=(1-beta2))
         grad_sumsq_cols.mul_(beta2).add_(grad3d_sq.mean(dim=1, keepdim=True),
                                          alpha=(1-beta2))
-        grad_sumsq_cols.add_(eps)  # prevent division by zero
 
         bias_correction2 = 1 - beta2**step
         if bias_correction2 < 0.99:
@@ -1599,10 +1597,10 @@ quantized_float: this is a temporary value passed into avoid recomputing it;
         # average squared gradient, per element of the tensor.
         # This is the same way it's done in Adafactor; these two factors
         # are called R and C there.
-        gradsq = (grad_sumsq_rows * (grad_sumsq_cols / grad_sumsq_cols.mean()))
+        gradsq = (grad_sumsq_rows * (grad_sumsq_cols / (grad_sumsq_cols.mean(dim=(1, 2)) + (eps*eps))))
         gradsq = gradsq.reshape(*grad.shape)
 
-        return (gradsq + eps).sqrt()
+        return gradsq.sqrt() + eps
 
 
     def _step_scalar(self, group: dict, p: Tensor, grad: Tensor, state: dict):
@@ -1983,7 +1981,7 @@ def _test_optimizers(hidden_dim: int):
     input_magnitudes = (1.0 * torch.randn(E, dtype=dtype, device=device)).exp()
     output_magnitudes = (1.0 * torch.randn(E, dtype=dtype, device=device)).exp()
 
-    for expt in [ 'FSAdafactor8_float16', 'FSAdafactor8', 'FSAdafactor4', 'ScaledAdam', 'Eve' ]:
+    for expt in [ 'FSAdafactor12', 'FSAdafactor8_float16', 'FSAdafactor8', 'FSAdafactor4', 'ScaledAdam', 'Eve' ]:
         fix_random_seed(42)
         Linear = torch.nn.Linear
 
@@ -2010,8 +2008,9 @@ def _test_optimizers(hidden_dim: int):
             optim = Eve(m.parameters(), lr=0.003)
         elif expt == 'ScaledAdam':
             optim = ScaledAdam(m.parameters(), lr=0.03, clipping_scale=2.0)
-        elif expt in [ 'FSAdafactor8', 'FSAdafactor8_float16' ]:
-            optim = FSAdafactor(m.parameters(), lr=0.03, clipping_scale=2.0)
+        elif expt in [ 'FSAdafactor8', 'FSAdafactor8_float16', 'FSAdafactor12' ]:
+            optim = FSAdafactor(m.parameters(), lr=0.03, clipping_scale=2.0,
+                                param_bits=(12 if 'factor12' in expt else 8))
         else:
             assert expt == 'FSAdafactor4'
             optim = FSAdafactor(m.parameters(), lr=0.03, clipping_scale=2.0,
