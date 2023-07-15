@@ -1468,6 +1468,9 @@ class FSAdafactor(BatchedOptimizer):
                                                         keepdim=True)
             q = q.sqrt().clamp_(min=2**11)
             state["quantized_rms"].copy_(q)
+            #if random.random() < 0.02:
+            #    ratio = q / (2 ** 15)
+            #    logging.info(f"q_rms ratio = {ratio}, shape={quantized.shape}")
 
         if True:
             # This block updates "quantized"
