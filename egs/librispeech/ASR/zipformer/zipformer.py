@@ -351,13 +351,13 @@ class Zipformer2(EncoderInterface):
         x = self._get_full_dim_output(outputs)
         x = self.downsample_output(x)
         # class Downsample has this rounding behavior..
-        assert self.output_downsampling_factor == 2, self.output_downsampling_factor
+        ds = self.output_downsampling_factor
         if torch.jit.is_scripting() or torch.jit.is_tracing():
-            lengths = (x_lens + 1) // 2
+            lengths = (x_lens + ds - 1) // ds
         else:
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore")
-                lengths = (x_lens + 1) // 2
+                lengths = (x_lens + ds - 1) // ds
 
         return x, lengths
 
