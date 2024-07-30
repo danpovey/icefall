@@ -1337,6 +1337,34 @@ class Dropout3(nn.Module):
         return ans
 
 
+class Dropout3Simple(nn.Module):
+    # as Dropout3 but no fancy stuff in backprop
+    def __init__(self, p: FloatLike, shared_dim: int):
+        super().__init__()
+        self.p = p
+        self.shared_dim = shared_dim
+
+    def forward(self, x: Tensor) -> Tensor:
+        p = float(self.p)
+        if not self.training or p == 0:
+            return _no_op(x)
+        scale = 1.0 / (1 - p)
+        rand_shape = list(x.shape)
+        rand_shape[self.shared_dim] = 1
+        mask = torch.rand(*rand_shape, device=x.device) > p
+        return (x * mask) * scale
+
+
+
+class SwooshLSimple(nn.Module):
+    def __init__(self):
+        super().__init__()
+    def forward(x):
+        zero = torch.tensor(0.0, dtype=x.dtype, device=x.device)
+        coeff = -0.08
+        return torch.logaddexp(zero, x - 4.0) + coeff * x - 0.035
+
+
 class SwooshLFunction(torch.autograd.Function):
     """
     swoosh_l(x) =  log(1 + exp(x-4)) - 0.08*x - 0.035

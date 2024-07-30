@@ -44,6 +44,8 @@ from scaling import (
     limit_param_value,
     penalize_abs_values_gt,
     softmax,
+    SwooshLSimple,
+    Dropout3Simple,
 )
 from torch import Tensor, nn
 
@@ -632,7 +634,8 @@ class Zipformer2EncoderLayer(nn.Module):
 
         #self.feed_forward2 = FeedforwardModule(embed_dim, feedforward_dim, dropout)
 
-        self.feed_forward2 = FeedforwardDerivModule(embed_dim, feedforward_dim)
+        self.feed_forward2 = DerivModule(
+            SimpleFeedforwardModule(embed_dim, feedforward_dim, dropout))
 
         self.feed_forward3 = FeedforwardModule(
             embed_dim, (feedforward_dim * 5) // 4, dropout
@@ -2034,52 +2037,48 @@ class FeedforwardModule(nn.Module):
 
 
 
-class FeedforwardDerivModule(nn.Module):
-    """Special kind of feedforward module used in Zipformer2 model, based on derivative of a scalar function."""
+class SimpleFeedforwardModule(nn.Module):
+    """Version of FeedforwardModule that uses no torch.autograd.Function so will support
+      second derivatives straightforwardly"""
 
-    def __init__(self, embed_dim: int, feedforward_dim: int):
+    def __init__(self, embed_dim: int, feedforward_dim: int, dropout: FloatLike):
         super().__init__()
         self.in_proj = nn.Linear(embed_dim, feedforward_dim)
+        self.activation = SwooshLSimple()
+        self.dropout = Dropout3Simple(dropout)
+        self.out_proj = nn.Linear(feedforward_dim, embed_dim)
 
-        self.activation1 = nn.SiLU()
+    def forward(self, x):
+        x = self.in_proj(x)
+        x = self.activation(x)
+        x = self.dropout(x)
+        x = self.out_proj(x)
+        return x
 
-        self.out_scale = nn.Parameter(torch.ones(feedforward_dim))
-        self.out_proj = nn.Linear(feedforward_dim, embed_dim, bias=False)
-        # to make the 2-form
+
+
+class DerivModule(nn.Module):
+    """Special kind of wrapper module that augments a function with its derivative"""
+
+    def __init__(self, module: nn.Module, embed_dim: int):
+        super().__init__()
+        self.module = module
+
         self.inner_proj = nn.Linear(embed_dim, embed_dim)
-
         self.deriv_out_proj = nn.Linear(embed_dim, embed_dim)
 
 
-    def forward(self, x, src_key_padding_mask=None):
-        if src_key_padding_mask is None:
-            mask = 1.0
-        else:
-            mask = 1.0 - src_key_padding_mask.to(x.dtype).transpose(0, 1).unsqueeze(-1)
-        # mask: 1.0, or of shape (seq_len, batch_size, 1)
-
+    def forward(self, x):
         with torch.enable_grad():
             if not x.requires_grad:
                 x = x.detach()
                 x.requires_grad = True
-            out, quasi_loss = self.forward_simple(x, mask)
-
+            y = self.module(x)
+            quasi_loss = (y * self.inner_proj(y)).sum()
             (x_grad,) = torch.autograd.grad([quasi_loss], [x],
                                             create_graph=True,
                                             retain_graph=True)
             return out + self.deriv_out_proj(x_grad)
-
-    def forward_simple(self, x, mask):
-        # x: (seq_len, batch_size, embed_dim)
-        # mask: 1.0, or of shape (seq_len, batch_size, 1)
-
-        # forward that gives a scalar
-        x = self.in_proj(x)
-        x = self.activation1(x)
-        x = self.out_proj(x)
-        quasi_loss = (x * self.inner_proj(x)).sum()
-        return x, quasi_loss
-
 
 
 
