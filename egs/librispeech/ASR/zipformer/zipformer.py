@@ -833,7 +833,7 @@ class Zipformer2EncoderLayer(nn.Module):
         else:
             ff2_skip_rate = float(self.ff2_skip_rate) if self.training else 0.0
         src = src + self.sequence_dropout(
-            self.balancer_ff2(self.feed_forward2(src)), ff2_skip_rate
+            self.balancer_ff2(self.feed_forward2(src, src_key_padding_mask=src_key_padding_mask)), ff2_skip_rate
         )
 
         # bypass in the middle of the layer.
@@ -2053,25 +2053,36 @@ class FeedforwardDerivModule(nn.Module):
         self.activation3 = nn.SiLU()
         self.final_proj = nn.Linear(late_dim, 1, bias=False)
 
-    def forward(self, x):
+    def forward(self, x, src_key_padding_mask=None):
+        if src_key_padding_mask is None:
+            mask = 1.0
+        else:
+            mask = 1.0 - src_key_padding_mask.to(x.dtype).transpose(0, 1).unsqueeze(-1)
+        # mask: 1.0, or of shape (seq_len, batch_size, 1)
+
         with torch.enable_grad():
             if not x.requires_grad:
                 x = x.detach()
                 x.requires_grad = True
-            quasi_loss = self.forward_simple(x)
+            quasi_loss = self.forward_simple(x, mask)
             (x_grad,) = torch.autograd.grad([quasi_loss], [x],
                                             create_graph=True,
                                             retain_graph=True)
             return x_grad
 
-    def forward_simple(self, x):
+    def forward_simple(self, x, mask):
+        # x: (seq_len, batch_size, embed_dim)
+        # mask: 1.0, or of shape (seq_len, batch_size, 1)
+
         # forward that gives a scalar
         x = self.in_proj(x)
         x = self.activation1(x)
         x = self.mid_proj(x)
         x = self.activation2(x)
         # x: (seq_len, batch_size, embedding_dim)
-        x = x.mean(dim=0)  #  now: (batch_size, embedding_dim)
+        eps = 1.0e-04
+        mask_sum = (eps + (mask.sum(dim=0) if isinstance(mask, Tensor) else mask))
+        x = (x * mask).sum(dim=0) / mask_sum  #  now: x (batch_size, embedding_dim)
         x = self.pooled_proj1(x)
         x = self.activation3(x)
         x = self.pooled_proj2(x)
@@ -2080,7 +2091,7 @@ class FeedforwardDerivModule(nn.Module):
         x = x / ((x ** 2).mean(dim=1, keepdim=True) + eps).sqrt()
         x = self.final_proj(x)
         # now x: (batch_size, 1)
-        return x.sum()
+        return (x * mask_sum).sum()
 
 
 
