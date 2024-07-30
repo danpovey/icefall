@@ -2042,12 +2042,12 @@ class FeedforwardDerivModule(nn.Module):
         self.in_proj = nn.Linear(embed_dim, feedforward_dim)
 
         self.activation1 = nn.SiLU()
-        late_dim = embed_dim
-        self.offset = nn.Parameter(0.1 * torch.ones(feedforward_dim))
 
+        self.out_scale = nn.Parameter(torch.ones(feedforward_dim))
+        self.out_proj = nn.Linear(feedforward_dim, embed_dim, bias=False)
 
-        # project the derivative to the actual output
-        self.out_proj = nn.Linear(embed_dim, embed_dim)
+        self.deriv_out_proj = nn.Linear(embed_dim, embed_dim)
+
 
     def forward(self, x, src_key_padding_mask=None):
         if src_key_padding_mask is None:
@@ -2060,11 +2060,12 @@ class FeedforwardDerivModule(nn.Module):
             if not x.requires_grad:
                 x = x.detach()
                 x.requires_grad = True
-            quasi_loss = self.forward_simple(x, mask)
+            out, quasi_loss = self.forward_simple(x, mask)
+
             (x_grad,) = torch.autograd.grad([quasi_loss], [x],
                                             create_graph=True,
                                             retain_graph=True)
-            return self.out_proj(x_grad)
+            return out + self.deriv_out_proj(x_grad)
 
     def forward_simple(self, x, mask):
         # x: (seq_len, batch_size, embed_dim)
@@ -2073,8 +2074,8 @@ class FeedforwardDerivModule(nn.Module):
         # forward that gives a scalar
         x = self.in_proj(x)
         x = self.activation1(x)
-        x = (x + self.offset) ** 2
-        return (x * mask).sum()
+        quasi_loss = (x * self.out_scale).sum()
+        return self.out_proj(x), quasi_loss
 
 
 
