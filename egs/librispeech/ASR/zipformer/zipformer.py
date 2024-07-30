@@ -2045,6 +2045,8 @@ class FeedforwardDerivModule(nn.Module):
 
         self.out_scale = nn.Parameter(torch.ones(feedforward_dim))
         self.out_proj = nn.Linear(feedforward_dim, embed_dim, bias=False)
+        # to make the 2-form
+        self.inner_proj = nn.Linear(embed_dim, embed_dim)
 
         self.deriv_out_proj = nn.Linear(embed_dim, embed_dim)
 
@@ -2074,8 +2076,9 @@ class FeedforwardDerivModule(nn.Module):
         # forward that gives a scalar
         x = self.in_proj(x)
         x = self.activation1(x)
-        quasi_loss = (x * self.out_scale).sum()
-        return self.out_proj(x), quasi_loss
+        x = self.out_proj(x)
+        quasi_loss = (x * self.inner_proj(x)).sum()
+        return x, quasi_loss
 
 
 
