@@ -630,7 +630,9 @@ class Zipformer2EncoderLayer(nn.Module):
             embed_dim, (feedforward_dim * 3) // 4, dropout
         )
 
-        self.feed_forward2 = FeedforwardModule(embed_dim, feedforward_dim, dropout)
+        #self.feed_forward2 = FeedforwardModule(embed_dim, feedforward_dim, dropout)
+
+        self.feed_forward2 = FeedforwardDerivModule(embed_dim, feedforward_dim)
 
         self.feed_forward3 = FeedforwardModule(
             embed_dim, (feedforward_dim * 5) // 4, dropout
@@ -2028,6 +2030,59 @@ class FeedforwardModule(nn.Module):
         x = self.out_proj(x)
         x = self.out_whiten(x)
         return x
+
+
+
+
+class FeedforwardDerivModule(nn.Module):
+    """Special kind of feedforward module used in Zipformer2 model, based on derivative of a scalar function."""
+
+    def __init__(self, embed_dim: int, feedforward_dim: int):
+        super().__init__()
+        self.in_proj = nn.Linear(embed_dim, feedforward_dim)
+
+        self.activation1 = nn.SiLU()
+        late_dim = embed_dim // 2
+        self.mid_proj = nn.Linear(feedforward_dim, late_dim)
+
+        self.activation2 = nn.SiLU()
+
+        self.pooled_proj1 = nn.Linear(late_dim, late_dim)
+        self.pooled_proj2 = nn.Linear(late_dim, late_dim)
+
+        self.activation3 = nn.SiLU()
+        self.final_proj = nn.Linear(late_dim, 1, bias=False)
+
+    def forward(self, x):
+        with torch.enable_grad():
+            if not x.requires_grad:
+                x = x.detach()
+                x.requires_grad = True
+            quasi_loss = self.forward_simple(x)
+            (x_grad,) = torch.autograd.grad([quasi_loss], [x],
+                                            create_graph=True,
+                                            retain_graph=True)
+            return x_grad
+
+    def forward_simple(self, x):
+        # forward that gives a scalar
+        x = self.in_proj(x)
+        x = self.activation1(x)
+        x = self.mid_proj(x)
+        x = self.activation2(x)
+        # x: (seq_len, batch_size, embedding_dim)
+        x = x.mean(dim=0)  #  now: (batch_size, embedding_dim)
+        x = self.pooled_proj1(x)
+        x = self.activation3(x)
+        x = self.pooled_proj2(x)
+        # now apply length normalization
+        eps = 1.0e-04
+        x = x / ((x ** 2).mean(dim=1, keepdim=True) + eps).sqrt()
+        x = self.final_proj(x)
+        # now x: (batch_size, 1)
+        return x.sum()
+
+
 
 
 class NonlinAttention(nn.Module):
