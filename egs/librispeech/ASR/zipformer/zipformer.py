@@ -2043,15 +2043,8 @@ class FeedforwardDerivModule(nn.Module):
 
         self.activation1 = nn.SiLU()
         late_dim = embed_dim
-        self.mid_proj = nn.Linear(feedforward_dim, late_dim)
+        self.offset = nn.Parameter(0.1 * torch.ones(feedforward_dim))
 
-        self.activation2 = nn.SiLU()
-
-        self.pooled_proj1 = nn.Linear(late_dim, late_dim)
-        self.pooled_proj2 = nn.Linear(late_dim, late_dim)
-
-        self.activation3 = nn.SiLU()
-        self.final_proj = nn.Linear(late_dim, 1, bias=False)
 
         # project the derivative to the actual output
         self.out_proj = nn.Linear(embed_dim, embed_dim)
@@ -2080,21 +2073,8 @@ class FeedforwardDerivModule(nn.Module):
         # forward that gives a scalar
         x = self.in_proj(x)
         x = self.activation1(x)
-        x = self.mid_proj(x)
-        x = self.activation2(x)
-        # x: (seq_len, batch_size, embedding_dim)
-        eps = 1.0e-04
-        mask_sum = (eps + (mask.sum(dim=0) if isinstance(mask, Tensor) else mask))
-        x = (x * mask).sum(dim=0) / mask_sum  #  now: x (batch_size, embedding_dim)
-        x = self.pooled_proj1(x)
-        x = self.activation3(x)
-        x = self.pooled_proj2(x)
-        # now apply length normalization
-        eps = 1.0e-04
-        x = x / ((x ** 2).mean(dim=1, keepdim=True) + eps).sqrt()
-        x = self.final_proj(x)
-        # now x: (batch_size, 1)
-        return (x * mask_sum).sum()
+        x = (x + self.offset) ** 2
+        return (x * mask).sum()
 
 
 
