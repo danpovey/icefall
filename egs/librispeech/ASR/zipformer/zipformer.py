@@ -2042,7 +2042,7 @@ class FeedforwardDerivModule(nn.Module):
         self.in_proj = nn.Linear(embed_dim, feedforward_dim)
 
         self.activation1 = nn.SiLU()
-        late_dim = embed_dim // 2
+        late_dim = embed_dim
         self.mid_proj = nn.Linear(feedforward_dim, late_dim)
 
         self.activation2 = nn.SiLU()
