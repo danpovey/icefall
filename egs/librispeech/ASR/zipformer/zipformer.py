@@ -2053,6 +2053,9 @@ class FeedforwardDerivModule(nn.Module):
         self.activation3 = nn.SiLU()
         self.final_proj = nn.Linear(late_dim, 1, bias=False)
 
+        # project the derivative to the actual output
+        self.out_proj = nn.Linear(embed_dim, embed_dim)
+
     def forward(self, x, src_key_padding_mask=None):
         if src_key_padding_mask is None:
             mask = 1.0
@@ -2068,7 +2071,7 @@ class FeedforwardDerivModule(nn.Module):
             (x_grad,) = torch.autograd.grad([quasi_loss], [x],
                                             create_graph=True,
                                             retain_graph=True)
-            return x_grad
+            return self.out_proj(x_grad)
 
     def forward_simple(self, x, mask):
         # x: (seq_len, batch_size, embed_dim)
